@@ -1,0 +1,5 @@
+prefect>=2.10.0
+httpx[http2]>=0.27.0
+beautifulsoup4>=4.12.3
+pandas>=2.2.2
+aiofiles>=23.2.1

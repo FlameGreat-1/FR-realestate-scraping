@@ -1,0 +1,35 @@
+domain,status,reason
+Maisons Oxygène Agence d'Annecy,no_website,Initial input had no website URL
+NESTENN Nice Port,no_website,Initial input had no website URL
+2 M IMMOBILIER,no_website,Initial input had no website URL
+GLOBAL IMMO,no_website,Initial input had no website URL
+GUY HOQUET BOUC BEL AIR,no_website,Initial input had no website URL
+A2MB IMMO,no_website,Initial input had no website URL
+ABACUS FINANCE,no_website,Initial input had no website URL
+M Concept IMMOBILIER,no_website,Initial input had no website URL
+Agence des Flots,no_website,Initial input had no website URL
+IMMO'SO,no_website,Initial input had no website URL
+CHATILLON ESTATE,no_website,Initial input had no website URL
+MPI NUANCES IMMO,no_website,Initial input had no website URL
+ORIM - LARIMMO,no_website,Initial input had no website URL
+LIONROSE,no_website,Initial input had no website URL
+La Petite Agence- Picot Immobilier,no_website,Initial input had no website URL
+Proazur - Dagasso,no_website,Initial input had no website URL
+SAS SASU,no_website,Initial input had no website URL
+NOVA IMMO,no_website,Initial input had no website URL
+beausejour-immobilier.fr,error,"Page.goto: Timeout 20000ms exceeded.
+Call log:
+  - navigating to ""https://beausejour-immobilier.fr/sitemap.xml"", waiting until ""domcontentloaded""
+"
+capwestresidence.fr,no_listings,Could not find listings on site with either method
+zelidom.fr,error,"Page.goto: Timeout 20000ms exceeded.
+Call log:
+  - navigating to ""https://zelidom.fr/sitemap.xml"", waiting until ""domcontentloaded""
+"
+capwestresidence.fr,no_listings,Could not find listings on site with either method
+zelidom.fr,error,"Page.goto: Timeout 20000ms exceeded.
+Call log:
+  - navigating to ""https://zelidom.fr/sitemap.xml"", waiting until ""domcontentloaded""
+"
+stephaneplazaimmobilier.com,no_listings,Could not find listings on site with either method
+immobilier-nice-port.nestenn.com,unreachable,Site did not respond to HTTP probe — skipping Playwright
