@@ -3,3 +3,5 @@ httpx[http2]>=0.27.0
 beautifulsoup4>=4.12.3
 pandas>=2.2.2
 aiofiles>=23.2.1
+geopy>=2.4.1
+playwright>=1.58.0

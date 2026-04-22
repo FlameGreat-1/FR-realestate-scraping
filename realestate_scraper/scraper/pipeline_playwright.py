@@ -1,14 +1,14 @@
 import asyncio
-from pathlib import Path
 from typing import List, Dict, Any
 import csv
 import dataclasses
 
 from .domain_manager import deduplicate_domains
+from .input_paths import resolve_input_csv_path
 from .storage import write_listings, ERROR_LOG_CSV
 from .extractors.playwright_extractor import extract_listings_playwright
 
-CSV_PATH = Path(__file__).resolve().parents[2] / "FR_realestate_scraping - FR 140 (1).csv"
+CSV_PATH = resolve_input_csv_path()
 
 async def process_playwright_domain(domain_info: dict):
     domain = domain_info['domain']
@@ -45,7 +45,7 @@ async def run_playwright_pipeline(limit=None):
     print(f"Identified {len(failed_domains)} failed domains. Spinning up Playwright...")
     
     # Retrieve the root domain_info objects
-    domains_map = deduplicate_domains(str(CSV_PATH))
+    domains_map, _ = deduplicate_domains(str(CSV_PATH))
     job_queue = [domains_map[d] for d in failed_domains if d in domains_map]
     
     if limit is not None:

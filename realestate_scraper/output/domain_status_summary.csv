@@ -1,0 +1,113 @@
+domain,status,listing_count,error_status,reason
+2m-immo.com,success,83,,
+4mlagence.fr,failed,0,blocked,HTTP probe returned 403; Playwright also found no usable listings
+a2bimmo.com,success,1,,
+abacusfinance.com,failed,0,no_listings,Could not find listings on site with either method
+agence-beci.com,success,11,,
+agence-foresthill.fr,success,20,,
+agence-ik.fr,success,22,,
+agence-odeia-immobilier.com,failed,0,error,"Page.evaluate: Execution context was destroyed, most likely because of a navigation"
+agencealbert1er.fr,success,46,,
+agencecoullaud.fr,success,56,,
+agencedeneuville.com,success,18,,
+agencedesflots.com,success,8,,
+agencedubrivet.com,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+agencegrossi.com,success,4,,
+agencemathieu.fr,success,17,,
+agencexpertimmo.fr,success,20,,
+aio-immobiliere.com,success,1,,
+aixty.com,success,3,,
+ameliedherret-immo.com,success,41,,
+api-transaction.fr,success,5,,
+arp-immo.fr,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+atlanticviager.fr,success,6,,
+beausejour-immobilier.fr,failed,0,blocked,HTTP probe returned 403; Playwright also found no usable listings
+bouc-bel-air.guy-hoquet.com,success,1,,
+capsud-immo.com,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+capwestresidence.fr,failed,0,no_listings,Could not find listings on site with either method
+carmen-immobilier.com,failed,0,error,"Page.evaluate: Execution context was destroyed, most likely because of a navigation"
+chatillonestate.com,success,6,,
+cosialis.fr,success,3,,
+cote-immobilier.com,failed,0,error,"Page.evaluate: Execution context was destroyed, most likely because of a navigation"
+defis-immobiliers.com,success,13,,
+dhomeimmo.com,success,7,,
+dunkerque.stephaneplazaimmobilier.com,failed,0,blocked,HTTP probe returned 403; Playwright also found no usable listings
+erafrance.com,success,3,,
+erapontdelarc.com,failed,0,blocked,HTTP probe returned 403; Playwright also found no usable listings
+fhimmobilier.fr,success,3,,
+foch-immobilier.fr,success,13,,
+galyo.fr,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+gardnerimmobilier.com,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+gcdimmo.com,success,1,,
+global-immo.net,success,5,,
+grisel-immobilier.fr,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+groupe-condominium.fr,success,1,,
+groupe-tolosan-immobilier.com,success,25,,
+groupecif.com,success,4,,
+groupimmo.pro,success,36,,
+guchens.fr,success,1,,
+guy-hoquet.com,success,1,,
+himmo.fr,success,39,,
+homeconseils31.com,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+idimmo31.idimmo.net,failed,0,error,"Page.evaluate: Execution context was destroyed, most likely because of a navigation"
+igor-immobilier.com,success,25,,
+imbs-immo.com,success,28,,
+immobilier-marseille-8.nestenn.com,success,10,,
+immobilier-nice-port.nestenn.com,success,8,,
+immobilier-rambier.com,success,11,,
+immobilier-roquebrune-sur-argens.nestenn.com,success,9,,
+immobilier-saint-lys.nestenn.com,success,8,,
+immobiliere-abc.com,failed,0,no_listings,Could not find listings on site with either method
+immobiliere-de-croix.com,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+immoboucbelair.com,success,3,,
+immograndlyon.com,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+immoso.fr,success,2,,
+invalid,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+jeminstalleici.com,success,2,,
+laforet.com,success,33,,
+lagencelocale.com,success,8,,
+lagencetoulousaine.fr,failed,0,blocked,HTTP probe returned 403; Playwright also found no usable listings
+lamagiedelimmobilier.com,success,11,,
+lapetiteagence-immo.fr,success,1,,
+lapetiteagence-stlaurentdupont.fr,success,6,,
+laresidence.fr,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+larimmo.fr,success,7,,
+les-villas.fr,success,1,,
+lgo-immobilier.fr,success,18,,
+lionrose.fr,success,6,,
+locationsudest.com,success,4,,
+maisonbianchi.eu,failed,0,no_listings,Could not find listings on site with either method
+maisonsoxygene.com,success,15,,
+maxihome.net,success,12,,
+mconceptimmo.ch,success,5,,
+mg-immobilier.com,success,40,,
+momvacances.com,success,16,,
+montpellier-antigone.guy-hoquet.com,success,1,,
+mylogement.com,success,69,,
+nestenn.com,success,9,,
+nova.immobilien,success,1,,
+novilis.fr,success,1,,
+nuances-immo.fr,success,1,,
+parfumdimmobilier.fr,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+pbfimmobilier.fr,success,2,,
+pietrapolis.fr,success,22,,
+piriac-immobilier.fr,success,7,,
+proazurdagasso.fr,success,8,,
+reutterinvest.fr,success,3,,
+rhpatrimoine.com,success,47,,
+sorgel-immobilier.com,success,1,,
+sporting-immobilier.fr,success,12,,
+stephaneplazaimmobilier.com,failed,0,blocked,HTTP probe returned 403; Playwright also found no usable listings
+sti-immo.fr,success,1,,
+sylogest.fr,success,1,,
+tit-immobilier.com,failed,0,no_listings,Could not find listings on site with either method
+tropis-immobilier.fr,success,1,,
+vancia-immobilier.fr,success,4,,
+varces-immobilier.fr,success,9,,
+vignobleimmobilier.arthurimmo.com,success,34,,
+villefranche.pietrapolis.fr,success,11,,
+vivesimmobilier.fr,success,39,,
+vivreici.com,success,20,,
+well-estate.fr,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+wretmanestate.com,failed,0,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+zelidom.fr,success,2,,

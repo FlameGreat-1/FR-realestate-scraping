@@ -1,35 +1,39 @@
 domain,status,reason
-Maisons Oxygène Agence d'Annecy,no_website,Initial input had no website URL
-NESTENN Nice Port,no_website,Initial input had no website URL
-2 M IMMOBILIER,no_website,Initial input had no website URL
-GLOBAL IMMO,no_website,Initial input had no website URL
-GUY HOQUET BOUC BEL AIR,no_website,Initial input had no website URL
-A2MB IMMO,no_website,Initial input had no website URL
-ABACUS FINANCE,no_website,Initial input had no website URL
-M Concept IMMOBILIER,no_website,Initial input had no website URL
-Agence des Flots,no_website,Initial input had no website URL
-IMMO'SO,no_website,Initial input had no website URL
-CHATILLON ESTATE,no_website,Initial input had no website URL
-MPI NUANCES IMMO,no_website,Initial input had no website URL
-ORIM - LARIMMO,no_website,Initial input had no website URL
-LIONROSE,no_website,Initial input had no website URL
-La Petite Agence- Picot Immobilier,no_website,Initial input had no website URL
-Proazur - Dagasso,no_website,Initial input had no website URL
-SAS SASU,no_website,Initial input had no website URL
-NOVA IMMO,no_website,Initial input had no website URL
-beausejour-immobilier.fr,error,"Page.goto: Timeout 20000ms exceeded.
-Call log:
-  - navigating to ""https://beausejour-immobilier.fr/sitemap.xml"", waiting until ""domcontentloaded""
-"
-capwestresidence.fr,no_listings,Could not find listings on site with either method
-zelidom.fr,error,"Page.goto: Timeout 20000ms exceeded.
-Call log:
-  - navigating to ""https://zelidom.fr/sitemap.xml"", waiting until ""domcontentloaded""
-"
-capwestresidence.fr,no_listings,Could not find listings on site with either method
-zelidom.fr,error,"Page.goto: Timeout 20000ms exceeded.
-Call log:
-  - navigating to ""https://zelidom.fr/sitemap.xml"", waiting until ""domcontentloaded""
-"
-stephaneplazaimmobilier.com,no_listings,Could not find listings on site with either method
-immobilier-nice-port.nestenn.com,unreachable,Site did not respond to HTTP probe — skipping Playwright
+maxihome.net,error,list index out of range
+rhpatrimoine.com,error,list index out of range
+agencealbert1er.fr,error,list index out of range
+immobilier-nice-port.nestenn.com,error,list index out of range
+pietrapolis.fr,error,list index out of range
+capwestresidence.fr,error,list index out of range
+cosialis.fr,error,list index out of range
+sporting-immobilier.fr,error,list index out of range
+zelidom.fr,error,list index out of range
+nestenn.com,error,list index out of range
+maisonsoxygene.com,error,list index out of range
+stephaneplazaimmobilier.com,error,list index out of range
+mg-immobilier.com,error,list index out of range
+beausejour-immobilier.fr,blocked,HTTP probe returned 403; Playwright also found no usable listings
+agencegrossi.com,error,list index out of range
+wretmanestate.com,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+agencedeneuville.com,error,list index out of range
+aio-immobiliere.com,error,list index out of range
+erapontdelarc.com,blocked,HTTP probe returned 403; Playwright also found no usable listings
+mylogement.com,error,list index out of range
+novilis.fr,error,list index out of range
+erafrance.com,no_listings,Could not find listings on site with either method
+carmen-immobilier.com,error,list index out of range
+global-immo.net,error,list index out of range
+bouc-bel-air.guy-hoquet.com,error,list index out of range
+agence-beci.com,error,list index out of range
+dhomeimmo.com,error,list index out of range
+guy-hoquet.com,error,list index out of range
+agence-foresthill.fr,error,list index out of range
+aixty.com,error,list index out of range
+laresidence.fr,error,list index out of range
+groupe-tolosan-immobilier.com,error,list index out of range
+agencedubrivet.com,unreachable,Site did not respond to HTTP probe and Playwright found no usable listings
+sorgel-immobilier.com,error,list index out of range
+laforet.com,error,list index out of range
+immobilier-rambier.com,error,list index out of range
+montpellier-antigone.guy-hoquet.com,error,list index out of range
+immobilier-roquebrune-sur-argens.nestenn.com,error,list index out of range

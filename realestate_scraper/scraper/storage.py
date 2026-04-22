@@ -50,7 +50,7 @@ def deduplicate_final_csv():
     if not LISTINGS_CSV.exists():
         return
     
-    df = pd.read_csv(LISTINGS_CSV)
+    df = pd.read_csv(LISTINGS_CSV, dtype=str).fillna("")
     if df.empty:
         return
         
@@ -61,20 +61,17 @@ def deduplicate_final_csv():
     if 'reference_id' in df.columns:
         # Create a helper key for rows that have a reference_id
         # For rows without reference_id, we'll keep them for Strategy 2
-        df_with_id = df[df['reference_id'].notnull() & (df['reference_id'] != "")]
-        df_no_id = df[df['reference_id'].isnull() | (df['reference_id'] == "")]
+        df_with_id = df[df['reference_id'] != ""]
+        df_no_id = df[df['reference_id'] == ""]
         
         df_with_id = df_with_id.drop_duplicates(subset=['domain', 'reference_id'], keep='first')
         df = pd.concat([df_with_id, df_no_id])
 
-    # Strategy 2: Combination of unique attributes (price + location + property_type + surface_area)
-    # This catches duplicates across sites or missing reference_ids
-    dedup_cols = ['price', 'location', 'property_type', 'surface_area']
-    existing_cols = [c for c in dedup_cols if c in df.columns]
-    
-    if existing_cols:
-        df = df.drop_duplicates(subset=existing_cols, keep='first')
-    
+    # Strategy 2: Exact row identity when a reference ID is missing.
+    # Avoid collapsing distinct listings just because they share the same price/location mix.
+    if 'url' in df.columns:
+        df = df.drop_duplicates(subset=['domain', 'url'], keep='first')
+
     final_count = len(df)
     df.to_csv(LISTINGS_CSV, index=False, encoding='utf-8')
     print(f"Global Deduplication: Reduced {initial_count} -> {final_count} listings.")

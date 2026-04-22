@@ -13,7 +13,7 @@ def parse_domain(url: str) -> str:
     return domain.replace('www.', '')
 
 def deduplicate_domains(csv_path: str) -> Dict[str, Dict[str, Any]]:
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, dtype=str).fillna("")
     domains_map = {}
     
     no_website_entries = []

@@ -19,32 +19,99 @@ async def fetch_html(url: str, client: httpx.AsyncClient, timeout: float = 15.0)
 
 def _extract_from_json_ld(soup: BeautifulSoup) -> dict:
     data = {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            node_type = node.get("@type")
+            if node_type in ('Product', 'RealEstateListing', 'SingleFamilyResidence', 'House', 'Apartment', 'Accommodation'):
+                offers = node.get('offers')
+                if isinstance(offers, dict):
+                    for key in ('price', 'lowPrice', 'highPrice', 'priceValue'):
+                        if offers.get(key) not in (None, ""):
+                            data['price'] = str(offers.get(key))
+                            break
+                elif isinstance(offers, list):
+                    for offer in offers:
+                        if isinstance(offer, dict):
+                            for key in ('price', 'lowPrice', 'highPrice', 'priceValue'):
+                                if offer.get(key) not in (None, ""):
+                                    data['price'] = str(offer.get(key))
+                                    break
+                            if data.get('price'):
+                                break
+                for key in ('price', 'lowPrice', 'highPrice', 'priceValue'):
+                    if data.get('price'):
+                        break
+                    if node.get(key) not in (None, ""):
+                        data['price'] = str(node.get(key))
+                        break
+            for key, value in node.items():
+                if key in ('name', 'description') and isinstance(value, str):
+                    data[key] = value
+                elif key == 'address':
+                    addr = value
+                    if isinstance(addr, dict):
+                        data['location'] = f"{addr.get('addressLocality', '')} {addr.get('postalCode', '')}".strip()
+                    elif isinstance(addr, str):
+                        data['location'] = addr
+                elif key == 'geo' and isinstance(value, dict):
+                    data['coordinates'] = f"{value.get('latitude', '')}, {value.get('longitude', '')}".strip(', ')
+                elif isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
     for script in soup.find_all('script', type='application/ld+json'):
         try:
             content = script.string
             if not content:
                 continue
             parsed = json.loads(content)
-            if isinstance(parsed, list):
-                parsed = parsed[0]
-            if parsed.get('@type') in ('Product', 'RealEstateListing', 'SingleFamilyResidence', 'House', 'Apartment', 'Accommodation'):
-                if 'offers' in parsed and isinstance(parsed['offers'], dict):
-                    data['price'] = str(parsed['offers'].get('price', ''))
-                if 'name' in parsed:
-                    data['title'] = parsed['name']
-                if 'description' in parsed:
-                    data['description'] = parsed['description']
-                if 'address' in parsed:
-                    addr = parsed['address']
-                    if isinstance(addr, dict):
-                        data['location'] = f"{addr.get('addressLocality', '')} {addr.get('postalCode', '')}".strip()
-                    elif isinstance(addr, str):
-                        data['location'] = addr
-                if 'geo' in parsed and isinstance(parsed['geo'], dict):
-                    data['coordinates'] = f"{parsed['geo'].get('latitude', '')}, {parsed['geo'].get('longitude', '')}".strip(', ')
+            walk(parsed)
         except Exception:
             continue
     return data
+
+
+def _extract_phone_from_json_ld(soup: BeautifulSoup) -> str:
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            content = script.string
+            if not content:
+                continue
+            parsed = json.loads(content)
+            if isinstance(parsed, list):
+                parsed = parsed[0] if parsed else {}
+            stack = [parsed] if isinstance(parsed, dict) else []
+            while stack:
+                item = stack.pop()
+                if not isinstance(item, dict):
+                    continue
+                for key in ("telephone", "phone", "phoneNumber", "contactPoint"):
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        cleaned = _normalize_phone(value)
+                        if cleaned:
+                            return cleaned
+                    elif isinstance(value, dict):
+                        for nested_key in ("telephone", "phone", "phoneNumber"):
+                            nested_value = value.get(nested_key)
+                            if isinstance(nested_value, str):
+                                cleaned = _normalize_phone(nested_value)
+                                if cleaned:
+                                    return cleaned
+                    elif isinstance(value, list):
+                        stack.extend(v for v in value if isinstance(v, dict))
+                for nested_key in ("publisher", "author", "broker", "agent", "seller", "offers"):
+                    nested = item.get(nested_key)
+                    if isinstance(nested, dict):
+                        stack.append(nested)
+                    elif isinstance(nested, list):
+                        stack.extend(v for v in nested if isinstance(v, dict))
+        except Exception:
+            continue
+    return ""
 
 
 def _harvest_email(soup: BeautifulSoup, html: str) -> str:
@@ -87,10 +154,299 @@ def _rip_coordinates(soup: BeautifulSoup, html: str) -> str:
 
 
 def _clean_price(price_str: str) -> str:
-    """Strip non-digit characters from a price string, keeping only numbers."""
+    """Extract the first monetary amount from a price string."""
     if not price_str:
         return ""
-    return re.sub(r'[^\d]', '', price_str)
+    match = re.search(r"\d[\d\s\xa0.,]*", str(price_str))
+    if not match:
+        return ""
+    digits = re.sub(r'[^\d]', '', match.group(0))
+    if not digits:
+        return ""
+    # Guard against repeated captures like 620000620000.
+    if len(digits) % 2 == 0:
+        half = len(digits) // 2
+        if digits[:half] == digits[half:]:
+            digits = digits[:half]
+    return digits
+
+
+def _normalize_phone(phone_str: str) -> str:
+    if not phone_str:
+        return ""
+    raw = phone_str.strip()
+    digits = re.sub(r"[^\d]", "", raw)
+    if raw.startswith("+33") or raw.startswith("0033") or digits.startswith("33"):
+        local = digits[2:] if digits.startswith("33") else digits[4:] if digits.startswith("0033") else digits[2:]
+        if len(local) == 9:
+            return "0" + local
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if len(digits) < 8:
+        return ""
+    return digits
+
+
+def _extract_phone_from_dom(soup: BeautifulSoup, html: str) -> str:
+    tel_links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().startswith("tel:"):
+            tel_links.append(href.split(":", 1)[1])
+
+    # Prefer explicit tel: links.
+    for candidate in tel_links:
+        cleaned = _normalize_phone(candidate)
+        if cleaned:
+            return cleaned
+
+    # Fall back to local text around phone labels.
+    phone_label_patterns = [
+        r"(?:t[eé]l(?:[ée]phone)?|phone)\s*[:\-]?\s*([+\d][\d\s().-]{7,})",
+        r"([+\d][\d\s().-]{7,})\s*(?:t[eé]l(?:[ée]phone)?|phone)",
+    ]
+    for pattern in phone_label_patterns:
+        match = re.search(pattern, html, re.I)
+        if match:
+            cleaned = _normalize_phone(match.group(1))
+            if cleaned:
+                return cleaned
+
+    return ""
+
+
+def _extract_price_from_dom(soup: BeautifulSoup, text: str, url: str = "") -> str:
+    if url and re.search(r"(prix-m2|prix-rues|listing-categorie|achat-immobilier|vente-immobilier|/search(?:/|$)|/recherche(?:/|$)|/result(?:/|$)|/results(?:/|$)|/biens/result|/produits/all)", url, re.I):
+        return ""
+
+    candidates = []
+
+    selectors = [
+        "[itemprop='price']",
+        "[data-price]",
+        "[data-price-value]",
+        "[data-price-amount]",
+        "[class*='price' i]",
+        "[id*='price' i]",
+        "[class*='prix' i]",
+        "[id*='prix' i]",
+        "[class*='amount' i]",
+        "[id*='amount' i]",
+    ]
+    for selector in selectors:
+        for node in soup.select(selector):
+            candidate_text = node.get("content") or node.get("data-price") or node.get("data-price-value") or node.get("data-price-amount") or node.get_text(" ", strip=True)
+            if candidate_text:
+                candidates.append(candidate_text)
+
+    # Prioritize explicit price labels.
+    label_patterns = [
+        r"(?:prix(?:\s+de\s+vente)?|price)\s*[:\-]?\s*([^\n\r<]{2,50})",
+        r"([0-9][0-9\s\xa0.,]*)\s*€",
+    ]
+    for pattern in label_patterns:
+        for match in re.finditer(pattern, text, re.I):
+            candidates.append(match.group(1))
+
+    for candidate in candidates:
+        if re.search(r"sur\s+demande", candidate, re.I):
+            continue
+        if re.search(r"(prix\s*-?\s*m2|prix-rues|par\s+m2|€/m2|€/m²|m\s*[²2])", candidate, re.I):
+            continue
+        if "€" not in candidate and not re.search(r"(prix|price)", candidate, re.I):
+            continue
+        cleaned = _clean_price(candidate)
+        if cleaned and cleaned != "0":
+            return cleaned
+
+    return ""
+
+
+def _extract_dpe_rating(soup: BeautifulSoup, html: str) -> str:
+    # Prefer structured data if present.
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            content = script.string
+            if not content:
+                continue
+            parsed = json.loads(content)
+            if isinstance(parsed, list):
+                parsed = parsed[0] if parsed else {}
+            if isinstance(parsed, dict):
+                for key in (
+                    "energyEfficiencyCategory",
+                    "energyClass",
+                    "energyRating",
+                    "dpeRating",
+                    "epcRating",
+                    "epcCategory",
+                ):
+                    value = parsed.get(key)
+                    if isinstance(value, str):
+                        m = re.search(r"\b([A-G])\b", value, re.I)
+                        if m:
+                            return m.group(1).upper()
+        except Exception:
+            continue
+
+    text = " ".join(soup.stripped_strings)
+    text = re.sub(r"\s+", " ", text)
+    normalized = text.replace("é", "e").replace("É", "E")
+
+    labeled_patterns = [
+        r"(?:dpe|diagnostic(?: de performance)?(?: energetique| énergétique)?|performance energetique|performance énergétique)\s*[:\-]?\s*(?:classe\s*)?([A-G])\b",
+        r"(?:classe(?:ment)?(?: energie| énergétique)?|classe(?:ment)? d'?energie)\s*[:\-]?\s*([A-G])\b",
+        r"(?:consommation(?: energetique| énergétique)?)\s*[:\-]?\s*([A-G])\b",
+    ]
+    for pattern in labeled_patterns:
+        m = re.search(pattern, normalized, re.I)
+        if m:
+            return m.group(1).upper()
+
+    # Look for the rating directly adjacent to DPE-related terms.
+    adjacency_patterns = [
+        r"(?:dpe|diagnostic(?: de performance)?(?: energetique| énergétique)?).{0,40}\b([A-G])\b",
+        r"\b([A-G])\b.{0,40}(?:dpe|diagnostic(?: de performance)?(?: energetique| énergétique)?)",
+    ]
+    for pattern in adjacency_patterns:
+        m = re.search(pattern, normalized, re.I)
+        if m:
+            return m.group(1).upper()
+
+    # Inspect elements that explicitly mention DPE and their nearby text.
+    label_terms = re.compile(
+        r"(dpe|diagnostic de performance energetique|diagnostic de performance énergétique|classe énergie|classe energie|consommation énergétique|consommation energetique)",
+        re.I,
+    )
+    for node in soup.find_all(string=label_terms):
+        parent = getattr(node, "parent", None)
+        if not parent:
+            continue
+        parent_text = parent.get_text(" ", strip=True)
+        parent_text = re.sub(r"\s+", " ", parent_text)
+        for pattern in labeled_patterns + adjacency_patterns:
+            m = re.search(pattern, parent_text.replace("é", "e").replace("É", "E"), re.I)
+            if m:
+                return m.group(1).upper()
+
+    return "No DPE rating"
+
+
+def _is_candidate_listing_url(href: str) -> bool:
+    if not href:
+        return False
+
+    parsed = urlparse(href)
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    full = f"{path}?{query}" if query else path
+
+    if any(token in full for token in (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", "mailto:", "tel:", "facebook", "instagram", "linkedin")):
+        return False
+
+    exclude_terms = (
+        "contact", "agence", "about", "apropos", "a-propos", "team", "equipe",
+        "blog", "news", "actualites", "actualite", "article", "tag", "author",
+        "mentions-legales", "privacy", "politique", "estimation", "vendre-nous",
+    )
+    if any(term in full for term in exclude_terms):
+        return False
+
+    hub_paths = {
+        "/lots",
+        "/lot",
+        "/search",
+        "/recherche",
+        "/result",
+        "/results",
+        "/buy",
+        "/listing-categorie",
+        "/produits/all",
+        "/biens/result",
+        "/resultat.php",
+    }
+    normalized_path = path.rstrip("/")
+    if normalized_path in hub_paths:
+        return False
+    if normalized_path.endswith("/search") and normalized_path.count("/") <= 2:
+        return False
+    if normalized_path.endswith("/buy") and normalized_path.count("/") <= 2:
+        return False
+
+    hubish_patterns = (
+        r"achat-immobilier",
+        r"vente-immobilier",
+        r"listing-categorie",
+        r"prix-m2",
+        r"prix-rues",
+        r"/search(?:/|$)",
+        r"/recherche(?:/|$)",
+        r"/result(?:/|$)",
+        r"/results(?:/|$)",
+        r"/biens/result",
+        r"/produits/all",
+        r"/annonce(?:s)?(?:/|$)",
+    )
+    if any(re.search(pattern, full, re.I) for pattern in hubish_patterns):
+        return False
+
+    segments = [seg for seg in path.split("/") if seg]
+    if len(segments) <= 3 and re.fullmatch(r"[a-z-]+-\d{4,5}", segments[-1]) and not re.search(r"(ref-|reference|id-|\d{6,})", path, re.I):
+        return False
+    if len(segments) <= 3 and not re.search(r"(ref-|reference|id-|\d{6,}|-[a-z0-9]{10,})", path, re.I):
+        return False
+
+    include_terms = (
+        "listing", "lots", "lot", "biens", "bien",
+        "vente", "buy", "produit", "produits", "property", "properties",
+        "maison", "appartement", "villa", "terrain", "studio", "garage", "parking",
+    )
+    if any(term in full for term in include_terms):
+        return True
+
+    return bool(re.search(r"(\d{4,}|page=|rooms=|budget=|zipcode=|loc=vente|type=all)", full, re.I))
+
+
+def _extract_reference_id(url: str, text: str, soup: BeautifulSoup) -> str:
+    # JSON-LD / structured fields first.
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            content = script.string
+            if not content:
+                continue
+            parsed = json.loads(content)
+            if isinstance(parsed, list):
+                parsed = parsed[0]
+            if isinstance(parsed, dict):
+                for key in ("sku", "productID", "identifier", "ref", "reference", "reference_id"):
+                    value = parsed.get(key)
+                    if isinstance(value, str) and len(value.strip()) >= 3:
+                        return value.strip()
+        except Exception:
+            continue
+
+    # Label-based extraction from visible text.
+    patterns = [
+        r"(?:r[ée]f(?:[ée]rence)?|réf\.?|ref\.?|n°\s*id)\s*[:#\.-]?\s*([A-Za-z0-9][A-Za-z0-9_\-\/]{2,})",
+        r"(?:id)\s*[:#\.-]?\s*([A-Za-z0-9][A-Za-z0-9_\-\/]{2,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            candidate = match.group(1).strip().strip(".,;:")
+            if len(candidate) >= 3 and candidate.lower() not in {"ref", "reference", "id"}:
+                return candidate
+
+    # Fallback to the last path segment, with comma-separated ref support.
+    slug = urlparse(url).path.rstrip("/").split("/")[-1]
+    if "," in slug:
+        parts = [p for p in slug.split(",") if p]
+        if parts:
+            slug = parts[-1]
+    slug = slug.strip().strip(".,;:")
+    if len(slug) >= 3:
+        return slug
+    return ""
 
 
 async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listing:
@@ -103,26 +459,20 @@ async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listin
     ld_data = _extract_from_json_ld(soup)
 
     # 2. Price — handles "Prix : 621 000 €", "170,000 €(Fixe)", "621 000 €", etc.
-    price = ld_data.get('price', '')
+    price = _clean_price(str(ld_data.get('price', '')))
     if not price:
-        price_match = re.search(
-            r'(?:prix\s*(?:de\s*vente)?|price)\s*[:.-]?\s*([\d\s\xa0,.]+)\s*€'
-            r'|([\d\s\xa0,.]+)\s*€',
-            text, re.I
-        )
-        if price_match:
-            raw = price_match.group(1) or price_match.group(2)
-            price = _clean_price(raw)
-    else:
-        price = _clean_price(price)
+        price = _extract_price_from_dom(soup, text, url)
+    if not price and re.search(r"sur\s+demande", text, re.I):
+        price = ""
+    if price in {"0", "00", "000"}:
+        price = ""
 
     # 3. Reference ID - Stricter to avoid UI text spillover
-    ref_match = re.search(r'(?:r[ée]f(?:[ée]rence)?|ref|annonce)\s*[:.-]?\s*([a-zA-Z0-9_\-]+)', text, re.I)
-    reference_id = ref_match.group(1).strip() if ref_match else url.strip('/').split('/')[-1]
-    
-    # Avoid junk like "Partager" in ref_id if it picked up nearby UI text
-    if any(x in reference_id.lower() for x in ['partager', 'facebook', 'twitter']):
-        reference_id = url.strip('/').split('/')[-1]
+    reference_id = _extract_reference_id(url, text, soup)
+    if not reference_id or len(reference_id) < 3 or any(x in reference_id.lower() for x in ['partager', 'facebook', 'twitter', 'search', 'result', 'page']):
+        reference_id = _extract_reference_id(url, "", soup) or url.rstrip('/').split('/')[-1]
+        if "," in reference_id:
+            reference_id = reference_id.split(",")[-1]
 
     # 4. Property Type — scan title + h1
     prop_types = ['maison', 'appartement', 'villa', 'terrain', 'garage', 'studio',
@@ -163,8 +513,7 @@ async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listin
                 bedrooms = str(max(0, r_val - 1))
 
     # 9. DPE Rating - More robust regex
-    dpe_match = re.search(r'(?:classe|dpe|conso)\s*[eé]nergie\s*[:.-]?\s*([A-G])|DPE\s*[:.-]?\s*([A-G])', text, re.I)
-    dpe_rating = (dpe_match.group(1) or dpe_match.group(2)).upper() if dpe_match else ""
+    dpe_rating = _extract_dpe_rating(soup, html)
 
     # --- PHASE 3 TARGETS ---
 
@@ -208,14 +557,17 @@ async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listin
     # Email Detection
     email = _harvest_email(soup, html)
 
-    clean_phone = str(domain_info.get('phone', '')).strip()
-    if '.0' in clean_phone: clean_phone = clean_phone.split('.0')[0]
+    clean_phone = _extract_phone_from_dom(soup, html)
+    if not clean_phone:
+        clean_phone = _extract_phone_from_json_ld(soup)
+    if not clean_phone:
+        clean_phone = _normalize_phone(str(domain_info.get('phone', '')).strip())
 
     return Listing(
         reference_id=reference_id,
         domain=domain_info['domain'],
         url=url,
-        price=price.strip(),
+        price=price.strip() if isinstance(price, str) else str(price),
         property_type=property_type,
         location=location,
         surface_area=surface_area,
@@ -225,7 +577,7 @@ async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listin
         phone=clean_phone,
         email=email,
         coordinates=coordinates,
-        dpe_rating=dpe_rating
+        dpe_rating=dpe_rating or "No DPE rating"
     )
 
 
@@ -291,11 +643,24 @@ async def extract_listings_from_domain(domain_info: Dict[str, Any], client: http
         listing_urls = []
         for u in urls:
             path = urlparse(u).path
-            if include_pattern.search(path) and not exclude_pattern.search(path):
+            if _is_candidate_listing_url(u) or (include_pattern.search(path) and not exclude_pattern.search(path)):
                 listing_urls.append(u)
 
         listing_urls = list(set(listing_urls))[:100]
         print(f"[{domain_info['domain']}] Found {len(listing_urls)} potential listing URLs")
+
+    if not listing_urls:
+        home_html = await fetch_html(base_url, client, timeout=12.0)
+        if home_html:
+            print(f"[{domain_info['domain']}] Falling back to homepage link crawl...")
+            home_soup = BeautifulSoup(home_html, 'html.parser')
+            candidate_urls = []
+            for a in home_soup.find_all('a', href=True):
+                href = urljoin(base_url, a['href'])
+                if _is_candidate_listing_url(href):
+                    candidate_urls.append(href)
+            listing_urls = list(dict.fromkeys(candidate_urls))[:75]
+            print(f"[{domain_info['domain']}] Homepage crawl found {len(listing_urls)} potential listing URLs")
 
     if not listing_urls:
         print(f"[{domain_info['domain']}] No listing URLs found.")
@@ -305,28 +670,36 @@ async def extract_listings_from_domain(domain_info: Dict[str, Any], client: http
     junk_refs = {'trouv', 'aucun', 'recherche', 'liste', 'search', 'result', 'page', 'user', 'immobili', 'estimation', 'prix-m2'}
 
     all_listings = []
-    for idx, listing_url in enumerate(listing_urls):
-        if idx % 10 == 0:
-            print(f"[{domain_info['domain']}] Extracting {idx}/{len(listing_urls)}...")
-        page_html = await fetch_html(listing_url, client)
-        if not page_html:
-            continue
+    listing_semaphore = asyncio.Semaphore(20)
 
-        listing = await extract_listing_data(listing_url, page_html, domain_info)
+    async def process_listing(idx: int, listing_url: str):
+        async with listing_semaphore:
+            if idx % 10 == 0:
+                print(f"[{domain_info['domain']}] Extracting {idx}/{len(listing_urls)}...")
+            page_html = await fetch_html(listing_url, client)
+            if not page_html:
+                return None
 
-        # Apply agency email fallback
-        if not listing.email:
-            listing.email = agency_email
+            listing = await extract_listing_data(listing_url, page_html, domain_info)
 
-        # Reject junk/search/list pages by reference ID
-        if any(jr in listing.reference_id.lower() for jr in junk_refs):
-            continue
+            # Apply agency email fallback
+            if not listing.email:
+                listing.email = agency_email
 
-        # Keep only if at least one core field was found
-        if listing.price or listing.property_type or (listing.surface_area and listing.rooms):
-            all_listings.append(listing)
+            # Reject junk/search/list pages by reference ID
+            if any(jr in listing.reference_id.lower() for jr in junk_refs):
+                return None
 
-        await asyncio.sleep(0.1)
+            # Keep only if a price was found and at least one core field was found.
+            if listing.price and any([listing.reference_id, listing.property_type, listing.location, listing.surface_area, listing.rooms, listing.bedrooms]):
+                return listing
+
+            return None
+
+    tasks = [process_listing(idx, listing_url) for idx, listing_url in enumerate(listing_urls)]
+    for result in await asyncio.gather(*tasks):
+        if result is not None:
+            all_listings.append(result)
 
     print(f"[{domain_info['domain']}] Completed. Collected {len(all_listings)} listings.")
     return all_listings

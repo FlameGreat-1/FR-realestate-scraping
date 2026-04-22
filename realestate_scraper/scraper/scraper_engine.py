@@ -1,5 +1,4 @@
 import asyncio
-from pathlib import Path
 import pandas as pd
 import httpx
 from prefect import flow, task, get_run_logger
@@ -7,8 +6,9 @@ from prefect.tasks import task_input_hash
 from .data_models import CompanyInfo
 from .pattern_finder import discover_patterns
 from .storage import store_company_info
+from .input_paths import resolve_input_csv_path
 
-CSV_PATH = Path(r"c:\Users\abcre\Desktop\Project\F_realestate\FR_realestate_scraping - FR 140 (1).csv")
+CSV_PATH = resolve_input_csv_path()
 
 @task(retries=2, retry_delay_seconds=5)
 async def fetch_html(url: str) -> str:
@@ -56,7 +56,7 @@ def scraper_flow(limit: int = None) -> None:
     if not CSV_PATH.exists():
         logger.error(f"CSV file not found at {CSV_PATH}")
         return
-    df = pd.read_csv(CSV_PATH)
+    df = pd.read_csv(CSV_PATH, dtype=str).fillna("")
     logger.info(f"Loaded {len(df)} rows from CSV")
     
     if limit is not None:
