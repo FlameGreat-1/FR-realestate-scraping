@@ -3,8 +3,8 @@ from bs4 import BeautifulSoup
 from typing import List, Dict, Any
 from urllib.parse import urljoin, urlparse
 from .base import Listing
+from ..domain_seeds import get_additional_seed_urls
 from ..utils.geocoder import get_coordinates
-from ..utils.dpe_ocr import ocr_dpe_from_image_bytes
 import re
 import json
 import asyncio
@@ -16,14 +16,6 @@ async def fetch_html(url: str, client: httpx.AsyncClient, timeout: float = 15.0)
         return response.text if response.status_code == 200 else ""
     except Exception:
         return ""
-
-
-async def fetch_bytes(url: str, client: httpx.AsyncClient, timeout: float = 15.0) -> bytes:
-    try:
-        response = await client.get(url, follow_redirects=True, timeout=timeout)
-        return response.content if response.status_code == 200 else b""
-    except Exception:
-        return b""
 
 
 def _extract_from_json_ld(soup: BeautifulSoup) -> dict:
@@ -57,12 +49,23 @@ def _extract_from_json_ld(soup: BeautifulSoup) -> dict:
             for key, value in node.items():
                 if key in ('name', 'description') and isinstance(value, str):
                     data[key] = value
+                elif key in ('url', '@id') and isinstance(value, str):
+                    data['url'] = value
                 elif key == 'address':
                     addr = value
                     if isinstance(addr, dict):
                         data['location'] = f"{addr.get('addressLocality', '')} {addr.get('postalCode', '')}".strip()
                     elif isinstance(addr, str):
                         data['location'] = addr
+                elif key == 'mainEntityOfPage':
+                    if isinstance(value, str):
+                        data['url'] = value
+                    elif isinstance(value, dict):
+                        for nested_key in ('@id', 'url'):
+                            nested_value = value.get(nested_key)
+                            if isinstance(nested_value, str) and nested_value.strip():
+                                data['url'] = nested_value.strip()
+                                break
                 elif key == 'geo' and isinstance(value, dict):
                     data['coordinates'] = f"{value.get('latitude', '')}, {value.get('longitude', '')}".strip(', ')
                 elif isinstance(value, (dict, list)):
@@ -83,159 +86,78 @@ def _extract_from_json_ld(soup: BeautifulSoup) -> dict:
     return data
 
 
-def _looks_like_agency_name(name: str) -> bool:
-    if not name:
-        return False
-    candidate = re.sub(r"\s+", " ", str(name)).strip(" -|,:;")
-    if len(candidate) < 3 or len(candidate) > 90:
-        return False
+def _resolve_detail_url(soup: BeautifulSoup, ld_data: dict, fallback_url: str) -> str:
+    """Choose the most specific same-site detail URL we can infer from the page."""
+    candidates: list[str] = []
+    fallback = (fallback_url or "").split("#")[0].strip()
+    fallback_netloc = urlparse(fallback).netloc.lower().replace("www.", "")
 
-    lowered = candidate.lower()
-    if any(token in lowered for token in ("logo ", "groupe d'agence", "trouvez votre", "chercher une", "nos agences")):
-        return False
-    if lowered in {"breadcrumb", "vente", "location", "maison", "appartement", "villa", "terrain", "accueil", "home"}:
-        return False
-    if re.search(r"\b(\d{3,}|\d+\s*pi[eè]ces?|\d+\s*m[²2]|ref[\s:-]?\w+)\b", lowered, re.I):
-        return False
-
-    return bool(
-        re.search(
-            r"(agence|immobilier|immo|nestenn|orpi|lafor[eê]t|century|pietrapolis|arthurimmo|transaction|patrimoine|propri[eé]t[eé])",
-            lowered,
-            re.I,
-        )
-    )
-
-
-def _normalize_agency_candidate(name: str) -> str:
-    candidate = re.sub(r"\s+", " ", str(name).replace("\ufeff", " ")).strip(" -|,:;")
-    brand_match = re.search(
-        r"\b(Nestenn|Pietrapolis|Arthurimmo|Orpi|LaforÃªt|Century 21|[A-Z][A-Za-z0-9'&.-]{2,40}\s+Immobilier)\b",
-        candidate,
-        re.I,
-    )
-    if brand_match and re.search(r"(trouvez|chercher|logo|groupe d'agence|agence immobili[Ã¨e]re)", candidate, re.I):
-        return re.sub(r"\s+", " ", brand_match.group(1)).strip(" -|,:;")
-    for pattern in (
-        r"^(?:trouvez|chercher)\s+une\s+agence\s+immobili[èe]re\s+(.+)$",
-        r"^agence\s+immobili[èe]re\s+.+\s+-\s+(.+)$",
-        r"^l['’]agence\s+(.+)$",
-    ):
-        match = re.search(pattern, candidate, re.I)
-        if match:
-            reduced = re.sub(r"\s+", " ", match.group(1)).strip(" -|,:;")
-            if reduced:
-                candidate = reduced
-                break
-    return candidate
-
-
-def _extract_agency_name(soup: BeautifulSoup, domain_info: dict) -> str:
-    candidates = []
-
-    def add_candidate(value: str):
-        if not isinstance(value, str):
+    def add_candidate(raw_url: str | None):
+        if not raw_url:
             return
-        cleaned = _normalize_agency_candidate(value)
-        variants = [cleaned]
-        if " - " in cleaned:
-            variants.extend(part.strip() for part in cleaned.split(" - "))
-        match = re.search(r"(Agence\s+[A-Z][^|,:;]{1,60})", cleaned)
-        if match:
-            variants.append(match.group(1).strip())
-        match = re.search(r"(?:agence immobili[èe]re\s+)([A-Z][^|,:;]{1,60})", cleaned, re.I)
-        if match:
-            variants.append(match.group(1).strip())
-        match = re.search(r"(Pietrapolis|Nestenn|Arthurimmo|Orpi|Laforêt|Century 21|[A-Z][A-Za-z0-9'& .-]{2,40}\s+Immobilier)", cleaned, re.I)
-        if match:
-            variants.append(match.group(1).strip())
+        raw_url = str(raw_url).strip()
+        if not raw_url or raw_url.startswith(("mailto:", "tel:", "javascript:", "#")):
+            return
+        abs_url = urljoin(fallback_url, raw_url).split("#")[0]
+        parsed = urlparse(abs_url)
+        if parsed.scheme not in {"http", "https"}:
+            return
+        netloc = parsed.netloc.lower().replace("www.", "")
+        if netloc != fallback_netloc:
+            return
+        candidates.append(abs_url)
 
-        for variant in variants:
-            variant = _normalize_agency_candidate(variant)
-            if variant and _looks_like_agency_name(variant) and variant not in candidates:
-                candidates.append(variant)
+    canonical_link = soup.find("link", rel=re.compile(r"canonical", re.I))
+    if canonical_link:
+        add_candidate(canonical_link.get("href") or canonical_link.get("content"))
 
-    def candidate_score(value: str) -> tuple:
-        lowered = value.lower()
-        score = 0
-        if re.search(r"\b(igor immobilier|pietrapolis|nestenn|arthurimmo|orpi|lafor[eê]t|century 21)\b", lowered, re.I):
-            score += 6
-        if re.search(r"\bagence\s+[a-z0-9]", lowered, re.I):
-            score += 4
-        if "immobilier" in lowered or "immo" in lowered:
-            score += 3
-        if "agences immobili" in lowered:
-            score -= 4
-        if any(token in lowered for token in ("trouvez", "notre", "nos ", "blog", "gestion", "estimation", "vendre", "quartier")):
-            score -= 5
-        if "agence immobilière" in lowered and " - " in value:
-            score -= 2
-        return (score, -len(value))
+    og_url = soup.find("meta", property=re.compile(r"^og:url$", re.I))
+    if og_url:
+        add_candidate(og_url.get("content"))
 
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            content = script.string
-            if not content:
-                continue
-            parsed = json.loads(content)
-        except Exception:
-            continue
+    twitter_url = soup.find("meta", attrs={"name": re.compile(r"^twitter:url$", re.I)})
+    if twitter_url:
+        add_candidate(twitter_url.get("content"))
 
-        stack = [parsed]
-        while stack:
-            node = stack.pop()
-            if isinstance(node, list):
-                stack.extend(node)
-                continue
-            if not isinstance(node, dict):
-                continue
+    if isinstance(ld_data.get("url"), str):
+        add_candidate(ld_data["url"])
 
-            node_type = str(node.get("@type", ""))
-            name = node.get("name")
-            if isinstance(name, str):
-                if re.search(r"(Organization|LocalBusiness|RealEstateAgent|RealEstateAgency|Broker|Residence|Store)", node_type, re.I):
-                    add_candidate(name)
-                elif any(k in node for k in ("telephone", "email", "logo", "address", "aggregateRating")):
-                    add_candidate(name)
-
-            for value in node.values():
-                if isinstance(value, (dict, list)):
-                    stack.append(value)
-
-    meta_site = soup.find("meta", property=re.compile(r"og:site_name", re.I))
-    if meta_site:
-        add_candidate(meta_site.get("content", ""))
-
-    meta_title = soup.find("meta", property=re.compile(r"og:title", re.I))
-    if meta_title:
-        for piece in re.split(r"[|–-]", meta_title.get("content", "")):
-            add_candidate(piece)
-
-    title_text = soup.title.string if soup.title and soup.title.string else ""
-    for piece in re.split(r"[|–-]", title_text):
-        add_candidate(piece)
-
-    for selector in (
-        "header a[title*='Agent immobilier' i]",
-        "header a[title*='agence' i]",
-        "a[title*='Agence immobili' i]",
-        "[class*='agency' i]",
-        "[class*='agence' i]",
-        "[class*='brand' i]",
-        "[class*='logo' i]",
-    ):
-        for node in soup.select(selector):
-            add_candidate(node.get_text(" ", strip=True))
-            add_candidate(node.get("title", ""))
-            add_candidate(node.get("alt", ""))
-
-    input_name = re.sub(r"\s+", " ", str(domain_info.get("agency_name", ""))).strip()
-    if _looks_like_agency_name(input_name):
-        add_candidate(input_name)
+    if isinstance(ld_data.get("url"), dict):
+        add_candidate(ld_data["url"].get("@id") or ld_data["url"].get("url"))
 
     if not candidates:
-        return input_name
-    return sorted(candidates, key=candidate_score, reverse=True)[0]
+        return fallback_url
+
+    fallback_parsed = urlparse(fallback_url)
+    fallback_path = fallback_parsed.path.rstrip("/")
+    fallback_segments = [part for part in fallback_path.split("/") if part]
+
+    def score(candidate: str) -> tuple[int, int, int]:
+        parsed = urlparse(candidate)
+        path = parsed.path.rstrip("/")
+        segments = [part for part in path.split("/") if part]
+        score_val = 0
+        if _is_candidate_listing_url(candidate):
+            score_val += 100
+        if len(segments) > len(fallback_segments):
+            score_val += 20
+        if len(path) > len(fallback_path):
+            score_val += 10
+        if re.search(r"(vente|achat|buy|annonce|bien|listing|details?|property|immobilier)", path, re.I):
+            score_val += 5
+        if parsed.query:
+            score_val += 1
+        return (score_val, len(segments), len(candidate))
+
+    best = max(dict.fromkeys(candidates), key=score)
+
+    if best == fallback_url:
+        return fallback_url
+    if _is_candidate_listing_url(best):
+        return best
+    if not _is_candidate_listing_url(fallback_url):
+        return best
+    return fallback_url
 
 
 def _extract_phone_from_json_ld(soup: BeautifulSoup) -> str:
@@ -457,39 +379,18 @@ def _extract_dpe_rating(soup: BeautifulSoup, html: str) -> str:
     text = re.sub(r"\s+", " ", text)
     normalized = text.replace("é", "e").replace("É", "E")
 
+    # Only accept explicitly labeled ratings.
     labeled_patterns = [
-        r"(?:dpe|diagnostic(?: de performance)?(?: energetique| énergétique)?|performance energetique|performance énergétique)\s*[:\-]?\s*(?:classe\s*)?([A-G])\b",
-        r"(?:classe(?:ment)?(?: energie| énergétique)?|classe(?:ment)? d'?energie)\s*[:\-]?\s*([A-G])\b",
-        r"(?:consommation(?: energetique| énergétique)?)\s*[:\-]?\s*([A-G])\b",
+        r"\bdpe\b\s*[:\-]?\s*(?:classe\s*)?([A-G])\b",
+        r"\bdiagnostic(?: de performance)?(?: energetique| énergétique)?\b\s*[:\-]?\s*(?:classe\s*)?([A-G])\b",
+        r"\bclasse(?:ment)?(?: energie| énergétique)?\b\s*[:\-]?\s*([A-G])\b",
+        r"\bconsommation(?: energetique| énergétique)?\b\s*[:\-]?\s*([A-G])\b",
     ]
     for pattern in labeled_patterns:
         m = re.search(pattern, normalized, re.I)
         if m:
             return m.group(1).upper()
 
-    raw_html_patterns = [
-        r"classe\s+[ée]nergie\s*([A-G])\b",
-        r"classe\s+climat\s*([A-G])\b",
-        r"\bdpe[_\s-]*([A-G])\b",
-        r"\bges[_\s-]*([A-G])\b",
-        r"new_dpe/(?:dpe|ges)_([A-G])\.svg",
-    ]
-    for pattern in raw_html_patterns:
-        m = re.search(pattern, html, re.I)
-        if m:
-            return m.group(1).upper()
-
-    # Look for the rating directly adjacent to DPE-related terms.
-    adjacency_patterns = [
-        r"(?:dpe|diagnostic(?: de performance)?(?: energetique| énergétique)?).{0,40}\b([A-G])\b",
-        r"\b([A-G])\b.{0,40}(?:dpe|diagnostic(?: de performance)?(?: energetique| énergétique)?)",
-    ]
-    for pattern in adjacency_patterns:
-        m = re.search(pattern, normalized, re.I)
-        if m:
-            return m.group(1).upper()
-
-    # Inspect elements that explicitly mention DPE and their nearby text.
     label_terms = re.compile(
         r"(dpe|diagnostic de performance energetique|diagnostic de performance énergétique|classe énergie|classe energie|consommation énergétique|consommation energetique)",
         re.I,
@@ -498,95 +399,13 @@ def _extract_dpe_rating(soup: BeautifulSoup, html: str) -> str:
         parent = getattr(node, "parent", None)
         if not parent:
             continue
-        parent_text = parent.get_text(" ", strip=True)
-        parent_text = re.sub(r"\s+", " ", parent_text)
-        for pattern in labeled_patterns + adjacency_patterns:
+        parent_text = re.sub(r"\s+", " ", parent.get_text(" ", strip=True))
+        for pattern in labeled_patterns:
             m = re.search(pattern, parent_text.replace("é", "e").replace("É", "E"), re.I)
             if m:
                 return m.group(1).upper()
 
     return "No DPE rating"
-
-
-def _find_dpe_image_urls(soup: BeautifulSoup, page_url: str) -> List[str]:
-    image_urls = []
-    seen = set()
-
-    def add_candidate(candidate: str):
-        if not candidate:
-            return
-        absolute = urljoin(page_url, candidate)
-        if absolute not in seen:
-            seen.add(absolute)
-            image_urls.append(absolute)
-
-    for img in soup.find_all("img"):
-        attrs = " ".join(
-            str(img.get(attr, ""))
-            for attr in ("src", "data-src", "data-lazy", "data-original", "alt", "class")
-        )
-        if re.search(r"(?:^|[/_-])(dpe|ges|energy)(?:[/_.-]|$)|conso_|climat|gaz_", attrs, re.I):
-            add_candidate(
-                img.get("src")
-                or img.get("data-src")
-                or img.get("data-lazy")
-                or img.get("data-original")
-            )
-
-    for node in soup.find_all(style=True):
-        style = node.get("style", "")
-        if not re.search(r"(dpe|ges|energy|new_dpe)", style, re.I):
-            continue
-        match = re.search(r"url\((['\"]?)([^)'\"]+)\1\)", style, re.I)
-        if match:
-            add_candidate(match.group(2))
-
-    label_terms = re.compile(r"(dpe|diagnostic|bilan [eé]nerg|classe [eé]nergie|performance [eé]nerg)", re.I)
-    for node in soup.find_all(string=label_terms):
-        parent = getattr(node, "parent", None)
-        if not parent:
-            continue
-        for img in parent.find_all("img"):
-            add_candidate(
-                img.get("src")
-                or img.get("data-src")
-                or img.get("data-lazy")
-                or img.get("data-original")
-            )
-        for near in parent.find_all_next("img", limit=4):
-            attrs = " ".join(str(near.get(attr, "")) for attr in ("src", "data-src", "alt", "class"))
-            if re.search(r"(dpe|ges|energy|conso_|gaz_)", attrs, re.I):
-                add_candidate(
-                    near.get("src")
-                    or near.get("data-src")
-                    or near.get("data-lazy")
-                    or near.get("data-original")
-                )
-
-    return image_urls[:6]
-
-
-async def _extract_dpe_rating_with_ocr(
-    soup: BeautifulSoup,
-    html: str,
-    page_url: str,
-    client: httpx.AsyncClient | None,
-) -> str:
-    dpe_rating = _extract_dpe_rating(soup, html)
-    if dpe_rating != "No DPE rating":
-        return dpe_rating
-    if client is None:
-        return dpe_rating
-
-    for image_url in _find_dpe_image_urls(soup, page_url):
-        image_bytes = await fetch_bytes(image_url, client, timeout=12.0)
-        if not image_bytes:
-            continue
-        ocr_rating = ocr_dpe_from_image_bytes(image_bytes, image_url=image_url)
-        if ocr_rating:
-            return ocr_rating
-
-    return dpe_rating
 
 
 def _is_candidate_listing_url(href: str) -> bool:
@@ -648,10 +467,11 @@ def _is_candidate_listing_url(href: str) -> bool:
         return False
 
     segments = [seg for seg in path.split("/") if seg]
-    last_segment = segments[-1] if segments else ""
-    if last_segment and len(segments) <= 3 and re.fullmatch(r"[a-z-]+-\d{4,5}", last_segment) and not re.search(r"(ref-|reference|id-|\d{6,})", path, re.I):
+    if not segments:
         return False
-    if segments and len(segments) <= 3 and not re.search(r"(ref-|reference|id-|\d{6,}|-[a-z0-9]{10,})", path, re.I):
+    if len(segments) <= 3 and re.fullmatch(r"[a-z-]+-\d{4,5}", segments[-1]) and not re.search(r"(ref-|reference|id-|\d{6,})", path, re.I):
+        return False
+    if len(segments) <= 3 and not re.search(r"(ref-|reference|id-|\d{6,}|-[a-z0-9]{10,})", path, re.I):
         return False
 
     include_terms = (
@@ -663,6 +483,36 @@ def _is_candidate_listing_url(href: str) -> bool:
         return True
 
     return bool(re.search(r"(\d{4,}|page=|rooms=|budget=|zipcode=|loc=vente|type=all)", full, re.I))
+
+
+async def _crawl_listing_pages(base_url: str, client: httpx.AsyncClient, seed_urls: List[str], max_pages: int = 60) -> List[Listing]:
+    queue = list(dict.fromkeys(seed_urls))
+    seen = set()
+    collected: List[Listing] = []
+    fallback_domain_info = {"domain": urlparse(base_url).netloc.replace("www.", ""), "url": base_url}
+    max_pages = max(10, max_pages)
+
+    while queue and len(seen) < max_pages:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+
+        page_html = await fetch_html(current, client, timeout=12.0)
+        if not page_html:
+            continue
+
+        listing = await extract_listing_data(current, page_html, fallback_domain_info)
+        if listing.price and any([listing.reference_id, listing.property_type, listing.location, listing.surface_area, listing.rooms, listing.bedrooms]):
+            collected.append(listing)
+
+        for a_href in re.findall(r'href=["\']([^"\']+)["\']', page_html, re.I):
+            child = urljoin(current, a_href)
+            if child.startswith(("http://", "https://")) and child not in seen and child not in queue:
+                if _is_crawl_seed_url(child, base_url) or _is_candidate_listing_url(child):
+                    queue.append(child)
+
+    return collected
 
 
 def _extract_reference_id(url: str, text: str, soup: BeautifulSoup) -> str:
@@ -707,7 +557,31 @@ def _extract_reference_id(url: str, text: str, soup: BeautifulSoup) -> str:
     return ""
 
 
-async def extract_listing_data(url: str, html: str, domain_info: dict, client: httpx.AsyncClient | None = None) -> Listing:
+def _is_crawl_seed_url(href: str, base_url: str) -> bool:
+    if not href:
+        return False
+    if not href.startswith(("http://", "https://")):
+        return False
+
+    href_netloc = urlparse(href).netloc.lower().replace("www.", "")
+    base_netloc = urlparse(base_url).netloc.lower().replace("www.", "")
+    if href_netloc != base_netloc:
+        return False
+
+    parsed = urlparse(href)
+    path = (parsed.path or "").lower()
+    full = f"{path}?{(parsed.query or '').lower()}" if parsed.query else path
+
+    if any(token in full for token in (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", "mailto:", "tel:", "facebook", "instagram", "linkedin", "youtube")):
+        return False
+
+    if any(term in full for term in ("contact", "agence", "blog", "news", "article", "mentions-legales", "privacy", "politique")):
+        return False
+
+    return True
+
+
+async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listing:
     soup = BeautifulSoup(html, 'html.parser')
     text = soup.get_text(separator=' ', strip=True)
     title = soup.title.string.lower() if soup.title and soup.title.string else ""
@@ -715,6 +589,7 @@ async def extract_listing_data(url: str, html: str, domain_info: dict, client: h
 
     # 1. Try JSON-LD first (high reliability)
     ld_data = _extract_from_json_ld(soup)
+    resolved_url = _resolve_detail_url(soup, ld_data, url)
 
     # 2. Price — handles "Prix : 621 000 €", "170,000 €(Fixe)", "621 000 €", etc.
     price = _clean_price(str(ld_data.get('price', '')))
@@ -771,7 +646,7 @@ async def extract_listing_data(url: str, html: str, domain_info: dict, client: h
                 bedrooms = str(max(0, r_val - 1))
 
     # 9. DPE Rating - More robust regex
-    dpe_rating = await _extract_dpe_rating_with_ocr(soup, html, url, client)
+    dpe_rating = _extract_dpe_rating(soup, html)
 
     # --- PHASE 3 TARGETS ---
 
@@ -821,21 +696,17 @@ async def extract_listing_data(url: str, html: str, domain_info: dict, client: h
     if not clean_phone:
         clean_phone = _normalize_phone(str(domain_info.get('phone', '')).strip())
 
-    agency_name = str(domain_info.get('agency_name', '')).strip()
-    if not agency_name or agency_name.lower() in {"unknown agency", "unknown"}:
-        agency_name = _extract_agency_name(soup, domain_info)
-
     return Listing(
         reference_id=reference_id,
         domain=domain_info['domain'],
-        url=url,
+        url=resolved_url,
         price=price.strip() if isinstance(price, str) else str(price),
         property_type=property_type,
         location=location,
         surface_area=surface_area,
         rooms=rooms,
         bedrooms=bedrooms,
-        agency_name=agency_name,
+        agency_name=domain_info.get('agency_name', ''),
         phone=clean_phone,
         email=email,
         coordinates=coordinates,
@@ -845,6 +716,7 @@ async def extract_listing_data(url: str, html: str, domain_info: dict, client: h
 
 async def extract_listings_from_domain(domain_info: Dict[str, Any], client: httpx.AsyncClient) -> List[Listing]:
     base_url = domain_info['url']
+    extra_seed_urls = get_additional_seed_urls(base_url)
     import warnings
     from bs4 import XMLParsedAsHTMLWarning
     warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -873,6 +745,7 @@ async def extract_listings_from_domain(domain_info: Dict[str, Any], client: http
     if not html or ('<loc>' not in html and '<sitemap>' not in html):
         html = await fetch_html(sitemap_url_alt, client)
     listing_urls = []
+    seed_urls = []
 
     if html and ('<loc>' in html or '<sitemap>' in html):
         print(f"[{domain_info['domain']}] Parsing sitemap...")
@@ -909,6 +782,7 @@ async def extract_listings_from_domain(domain_info: Dict[str, Any], client: http
                 listing_urls.append(u)
 
         listing_urls = list(set(listing_urls))[:100]
+        seed_urls = list(dict.fromkeys(seed_urls))[:100]
         print(f"[{domain_info['domain']}] Found {len(listing_urls)} potential listing URLs")
 
     if not listing_urls:
@@ -923,6 +797,18 @@ async def extract_listings_from_domain(domain_info: Dict[str, Any], client: http
                     candidate_urls.append(href)
             listing_urls = list(dict.fromkeys(candidate_urls))[:75]
             print(f"[{domain_info['domain']}] Homepage crawl found {len(listing_urls)} potential listing URLs")
+
+    for seed_url in extra_seed_urls:
+        if seed_url not in seed_urls:
+            seed_urls.append(seed_url)
+        if _is_candidate_listing_url(seed_url) and seed_url not in listing_urls:
+            listing_urls.append(seed_url)
+
+    if not listing_urls and seed_urls:
+        print(f"[{domain_info['domain']}] No direct listing URLs found; crawling internal seeds.")
+        rescued = await _crawl_listing_pages(base_url, client, seed_urls, max_pages=60)
+        print(f"[{domain_info['domain']}] Seed crawl rescued {len(rescued)} listings.")
+        return rescued
 
     if not listing_urls:
         print(f"[{domain_info['domain']}] No listing URLs found.")
@@ -942,7 +828,7 @@ async def extract_listings_from_domain(domain_info: Dict[str, Any], client: http
             if not page_html:
                 return None
 
-            listing = await extract_listing_data(listing_url, page_html, domain_info, client=client)
+            listing = await extract_listing_data(listing_url, page_html, domain_info)
 
             # Apply agency email fallback
             if not listing.email:

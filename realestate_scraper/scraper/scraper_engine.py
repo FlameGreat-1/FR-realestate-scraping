@@ -1,5 +1,5 @@
 import asyncio
-import pandas as pd
+import csv
 import httpx
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
@@ -24,7 +24,7 @@ async def fetch_html(url: str) -> str:
             return ""
 
 @task
-def process_company(row: pd.Series) -> None:
+def process_company(row: dict) -> None:
     logger = get_run_logger()
     website = str(row.get('website') or row.get('Website') or row.get('website_url') or "").strip()
     if not website:
@@ -56,14 +56,15 @@ def scraper_flow(limit: int = None) -> None:
     if not CSV_PATH.exists():
         logger.error(f"CSV file not found at {CSV_PATH}")
         return
-    df = pd.read_csv(CSV_PATH, dtype=str).fillna("")
-    logger.info(f"Loaded {len(df)} rows from CSV")
+    with CSV_PATH.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    logger.info(f"Loaded {len(rows)} rows from CSV")
     
     if limit is not None:
-        df = df.head(limit)
+        rows = rows[:limit]
         logger.info(f"Limiting to {limit} rows for testing")
         
-    for _, row in df.iterrows():
+    for row in rows:
         process_company(row)
 
 if __name__ == "__main__":

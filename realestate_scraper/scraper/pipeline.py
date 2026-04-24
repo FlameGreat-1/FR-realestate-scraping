@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import os
 from .domain_manager import deduplicate_domains
 from .input_paths import resolve_input_csv_path
 from .storage import init_storage, write_listings, write_error
@@ -16,6 +17,8 @@ DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+
+DEFAULT_DOMAIN_CONCURRENCY = max(1, int(os.getenv("SCRAPER_CONCURRENCY", "6")))
 
 
 async def probe_site(url: str, client: httpx.AsyncClient) -> int | None:
@@ -44,11 +47,17 @@ async def process_domain(domain_info: dict, client: httpx.AsyncClient, semaphore
                 listings = await extract_listings_playwright(domain_info)
             
             if not listings:
-                if probe_status in (401, 403, 429):
+                if probe_status in (401, 403):
                     write_error(
                         domain,
                         "blocked",
                         f"HTTP probe returned {probe_status}; Playwright also found no usable listings",
+                    )
+                elif probe_status == 429:
+                    write_error(
+                        domain,
+                        "rate_limited",
+                        "HTTP probe returned 429; site appears rate-limited but Playwright also found no usable listings",
                     )
                 elif probe_status is None or probe_status >= 500:
                     write_error(domain, "unreachable", "Site did not respond to HTTP probe and Playwright found no usable listings")
@@ -91,8 +100,11 @@ async def run_pipeline(limit=None):
     if limit is not None:
         domains_list = domains_list[:limit]
         
-    # Bounded concurrency: keep several domains in flight to reduce total runtime.
-    semaphore = asyncio.Semaphore(12)
+    # Bounded concurrency: keep several domains in flight without overloading
+    # the HTTP/Playwright stack. Lower defaults usually improve first-result time
+    # and reduce rate limiting on real estate sites.
+    print(f"Using domain concurrency: {DEFAULT_DOMAIN_CONCURRENCY}")
+    semaphore = asyncio.Semaphore(DEFAULT_DOMAIN_CONCURRENCY)
     
     async with httpx.AsyncClient(
         verify=False,

@@ -46,32 +46,41 @@ def write_error(domain: str, status: str, reason: str = "") -> None:
         })
 
 def deduplicate_final_csv():
-    import pandas as pd
     if not LISTINGS_CSV.exists():
         return
     
-    df = pd.read_csv(LISTINGS_CSV, dtype=str).fillna("")
-    if df.empty:
+    with LISTINGS_CSV.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
         return
-        
-    initial_count = len(df)
-    
-    # Strategy 1: Unique Reference IDs per domain
-    # Some sites might reuse IDs across domains, so we keep (domain, reference_id) unique
-    if 'reference_id' in df.columns:
-        # Create a helper key for rows that have a reference_id
-        # For rows without reference_id, we'll keep them for Strategy 2
-        df_with_id = df[df['reference_id'] != ""]
-        df_no_id = df[df['reference_id'] == ""]
-        
-        df_with_id = df_with_id.drop_duplicates(subset=['domain', 'reference_id'], keep='first')
-        df = pd.concat([df_with_id, df_no_id])
 
-    # Strategy 2: Exact row identity when a reference ID is missing.
-    # Avoid collapsing distinct listings just because they share the same price/location mix.
-    if 'url' in df.columns:
-        df = df.drop_duplicates(subset=['domain', 'url'], keep='first')
+    initial_count = len(rows)
+    seen_ref = set()
+    seen_url = set()
+    deduped = []
 
-    final_count = len(df)
-    df.to_csv(LISTINGS_CSV, index=False, encoding='utf-8')
+    for row in rows:
+        domain = row.get("domain", "")
+        reference_id = row.get("reference_id", "").strip()
+        url = row.get("url", "").strip()
+
+        if reference_id:
+            ref_key = (domain, reference_id)
+            if ref_key in seen_ref:
+                continue
+            seen_ref.add(ref_key)
+        elif url:
+            url_key = (domain, url)
+            if url_key in seen_url:
+                continue
+            seen_url.add(url_key)
+
+        deduped.append(row)
+
+    final_count = len(deduped)
+    with LISTINGS_CSV.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=LISTINGS_HEADERS)
+        writer.writeheader()
+        writer.writerows(deduped)
     print(f"Global Deduplication: Reduced {initial_count} -> {final_count} listings.")
