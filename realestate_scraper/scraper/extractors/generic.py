@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 from urllib.parse import urljoin, urlparse
 from .base import Listing
 from ..utils.geocoder import get_coordinates
+from ..utils.dpe_ocr import ocr_dpe_from_image_bytes
 import re
 import json
 import asyncio
@@ -15,6 +16,14 @@ async def fetch_html(url: str, client: httpx.AsyncClient, timeout: float = 15.0)
         return response.text if response.status_code == 200 else ""
     except Exception:
         return ""
+
+
+async def fetch_bytes(url: str, client: httpx.AsyncClient, timeout: float = 15.0) -> bytes:
+    try:
+        response = await client.get(url, follow_redirects=True, timeout=timeout)
+        return response.content if response.status_code == 200 else b""
+    except Exception:
+        return b""
 
 
 def _extract_from_json_ld(soup: BeautifulSoup) -> dict:
@@ -72,6 +81,161 @@ def _extract_from_json_ld(soup: BeautifulSoup) -> dict:
         except Exception:
             continue
     return data
+
+
+def _looks_like_agency_name(name: str) -> bool:
+    if not name:
+        return False
+    candidate = re.sub(r"\s+", " ", str(name)).strip(" -|,:;")
+    if len(candidate) < 3 or len(candidate) > 90:
+        return False
+
+    lowered = candidate.lower()
+    if any(token in lowered for token in ("logo ", "groupe d'agence", "trouvez votre", "chercher une", "nos agences")):
+        return False
+    if lowered in {"breadcrumb", "vente", "location", "maison", "appartement", "villa", "terrain", "accueil", "home"}:
+        return False
+    if re.search(r"\b(\d{3,}|\d+\s*pi[eè]ces?|\d+\s*m[²2]|ref[\s:-]?\w+)\b", lowered, re.I):
+        return False
+
+    return bool(
+        re.search(
+            r"(agence|immobilier|immo|nestenn|orpi|lafor[eê]t|century|pietrapolis|arthurimmo|transaction|patrimoine|propri[eé]t[eé])",
+            lowered,
+            re.I,
+        )
+    )
+
+
+def _normalize_agency_candidate(name: str) -> str:
+    candidate = re.sub(r"\s+", " ", str(name).replace("\ufeff", " ")).strip(" -|,:;")
+    brand_match = re.search(
+        r"\b(Nestenn|Pietrapolis|Arthurimmo|Orpi|LaforÃªt|Century 21|[A-Z][A-Za-z0-9'&.-]{2,40}\s+Immobilier)\b",
+        candidate,
+        re.I,
+    )
+    if brand_match and re.search(r"(trouvez|chercher|logo|groupe d'agence|agence immobili[Ã¨e]re)", candidate, re.I):
+        return re.sub(r"\s+", " ", brand_match.group(1)).strip(" -|,:;")
+    for pattern in (
+        r"^(?:trouvez|chercher)\s+une\s+agence\s+immobili[èe]re\s+(.+)$",
+        r"^agence\s+immobili[èe]re\s+.+\s+-\s+(.+)$",
+        r"^l['’]agence\s+(.+)$",
+    ):
+        match = re.search(pattern, candidate, re.I)
+        if match:
+            reduced = re.sub(r"\s+", " ", match.group(1)).strip(" -|,:;")
+            if reduced:
+                candidate = reduced
+                break
+    return candidate
+
+
+def _extract_agency_name(soup: BeautifulSoup, domain_info: dict) -> str:
+    candidates = []
+
+    def add_candidate(value: str):
+        if not isinstance(value, str):
+            return
+        cleaned = _normalize_agency_candidate(value)
+        variants = [cleaned]
+        if " - " in cleaned:
+            variants.extend(part.strip() for part in cleaned.split(" - "))
+        match = re.search(r"(Agence\s+[A-Z][^|,:;]{1,60})", cleaned)
+        if match:
+            variants.append(match.group(1).strip())
+        match = re.search(r"(?:agence immobili[èe]re\s+)([A-Z][^|,:;]{1,60})", cleaned, re.I)
+        if match:
+            variants.append(match.group(1).strip())
+        match = re.search(r"(Pietrapolis|Nestenn|Arthurimmo|Orpi|Laforêt|Century 21|[A-Z][A-Za-z0-9'& .-]{2,40}\s+Immobilier)", cleaned, re.I)
+        if match:
+            variants.append(match.group(1).strip())
+
+        for variant in variants:
+            variant = _normalize_agency_candidate(variant)
+            if variant and _looks_like_agency_name(variant) and variant not in candidates:
+                candidates.append(variant)
+
+    def candidate_score(value: str) -> tuple:
+        lowered = value.lower()
+        score = 0
+        if re.search(r"\b(igor immobilier|pietrapolis|nestenn|arthurimmo|orpi|lafor[eê]t|century 21)\b", lowered, re.I):
+            score += 6
+        if re.search(r"\bagence\s+[a-z0-9]", lowered, re.I):
+            score += 4
+        if "immobilier" in lowered or "immo" in lowered:
+            score += 3
+        if "agences immobili" in lowered:
+            score -= 4
+        if any(token in lowered for token in ("trouvez", "notre", "nos ", "blog", "gestion", "estimation", "vendre", "quartier")):
+            score -= 5
+        if "agence immobilière" in lowered and " - " in value:
+            score -= 2
+        return (score, -len(value))
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            content = script.string
+            if not content:
+                continue
+            parsed = json.loads(content)
+        except Exception:
+            continue
+
+        stack = [parsed]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list):
+                stack.extend(node)
+                continue
+            if not isinstance(node, dict):
+                continue
+
+            node_type = str(node.get("@type", ""))
+            name = node.get("name")
+            if isinstance(name, str):
+                if re.search(r"(Organization|LocalBusiness|RealEstateAgent|RealEstateAgency|Broker|Residence|Store)", node_type, re.I):
+                    add_candidate(name)
+                elif any(k in node for k in ("telephone", "email", "logo", "address", "aggregateRating")):
+                    add_candidate(name)
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+
+    meta_site = soup.find("meta", property=re.compile(r"og:site_name", re.I))
+    if meta_site:
+        add_candidate(meta_site.get("content", ""))
+
+    meta_title = soup.find("meta", property=re.compile(r"og:title", re.I))
+    if meta_title:
+        for piece in re.split(r"[|–-]", meta_title.get("content", "")):
+            add_candidate(piece)
+
+    title_text = soup.title.string if soup.title and soup.title.string else ""
+    for piece in re.split(r"[|–-]", title_text):
+        add_candidate(piece)
+
+    for selector in (
+        "header a[title*='Agent immobilier' i]",
+        "header a[title*='agence' i]",
+        "a[title*='Agence immobili' i]",
+        "[class*='agency' i]",
+        "[class*='agence' i]",
+        "[class*='brand' i]",
+        "[class*='logo' i]",
+    ):
+        for node in soup.select(selector):
+            add_candidate(node.get_text(" ", strip=True))
+            add_candidate(node.get("title", ""))
+            add_candidate(node.get("alt", ""))
+
+    input_name = re.sub(r"\s+", " ", str(domain_info.get("agency_name", ""))).strip()
+    if _looks_like_agency_name(input_name):
+        add_candidate(input_name)
+
+    if not candidates:
+        return input_name
+    return sorted(candidates, key=candidate_score, reverse=True)[0]
 
 
 def _extract_phone_from_json_ld(soup: BeautifulSoup) -> str:
@@ -303,6 +467,18 @@ def _extract_dpe_rating(soup: BeautifulSoup, html: str) -> str:
         if m:
             return m.group(1).upper()
 
+    raw_html_patterns = [
+        r"classe\s+[ée]nergie\s*([A-G])\b",
+        r"classe\s+climat\s*([A-G])\b",
+        r"\bdpe[_\s-]*([A-G])\b",
+        r"\bges[_\s-]*([A-G])\b",
+        r"new_dpe/(?:dpe|ges)_([A-G])\.svg",
+    ]
+    for pattern in raw_html_patterns:
+        m = re.search(pattern, html, re.I)
+        if m:
+            return m.group(1).upper()
+
     # Look for the rating directly adjacent to DPE-related terms.
     adjacency_patterns = [
         r"(?:dpe|diagnostic(?: de performance)?(?: energetique| énergétique)?).{0,40}\b([A-G])\b",
@@ -330,6 +506,87 @@ def _extract_dpe_rating(soup: BeautifulSoup, html: str) -> str:
                 return m.group(1).upper()
 
     return "No DPE rating"
+
+
+def _find_dpe_image_urls(soup: BeautifulSoup, page_url: str) -> List[str]:
+    image_urls = []
+    seen = set()
+
+    def add_candidate(candidate: str):
+        if not candidate:
+            return
+        absolute = urljoin(page_url, candidate)
+        if absolute not in seen:
+            seen.add(absolute)
+            image_urls.append(absolute)
+
+    for img in soup.find_all("img"):
+        attrs = " ".join(
+            str(img.get(attr, ""))
+            for attr in ("src", "data-src", "data-lazy", "data-original", "alt", "class")
+        )
+        if re.search(r"(?:^|[/_-])(dpe|ges|energy)(?:[/_.-]|$)|conso_|climat|gaz_", attrs, re.I):
+            add_candidate(
+                img.get("src")
+                or img.get("data-src")
+                or img.get("data-lazy")
+                or img.get("data-original")
+            )
+
+    for node in soup.find_all(style=True):
+        style = node.get("style", "")
+        if not re.search(r"(dpe|ges|energy|new_dpe)", style, re.I):
+            continue
+        match = re.search(r"url\((['\"]?)([^)'\"]+)\1\)", style, re.I)
+        if match:
+            add_candidate(match.group(2))
+
+    label_terms = re.compile(r"(dpe|diagnostic|bilan [eé]nerg|classe [eé]nergie|performance [eé]nerg)", re.I)
+    for node in soup.find_all(string=label_terms):
+        parent = getattr(node, "parent", None)
+        if not parent:
+            continue
+        for img in parent.find_all("img"):
+            add_candidate(
+                img.get("src")
+                or img.get("data-src")
+                or img.get("data-lazy")
+                or img.get("data-original")
+            )
+        for near in parent.find_all_next("img", limit=4):
+            attrs = " ".join(str(near.get(attr, "")) for attr in ("src", "data-src", "alt", "class"))
+            if re.search(r"(dpe|ges|energy|conso_|gaz_)", attrs, re.I):
+                add_candidate(
+                    near.get("src")
+                    or near.get("data-src")
+                    or near.get("data-lazy")
+                    or near.get("data-original")
+                )
+
+    return image_urls[:6]
+
+
+async def _extract_dpe_rating_with_ocr(
+    soup: BeautifulSoup,
+    html: str,
+    page_url: str,
+    client: httpx.AsyncClient | None,
+) -> str:
+    dpe_rating = _extract_dpe_rating(soup, html)
+    if dpe_rating != "No DPE rating":
+        return dpe_rating
+    if client is None:
+        return dpe_rating
+
+    for image_url in _find_dpe_image_urls(soup, page_url):
+        image_bytes = await fetch_bytes(image_url, client, timeout=12.0)
+        if not image_bytes:
+            continue
+        ocr_rating = ocr_dpe_from_image_bytes(image_bytes, image_url=image_url)
+        if ocr_rating:
+            return ocr_rating
+
+    return dpe_rating
 
 
 def _is_candidate_listing_url(href: str) -> bool:
@@ -391,9 +648,10 @@ def _is_candidate_listing_url(href: str) -> bool:
         return False
 
     segments = [seg for seg in path.split("/") if seg]
-    if len(segments) <= 3 and re.fullmatch(r"[a-z-]+-\d{4,5}", segments[-1]) and not re.search(r"(ref-|reference|id-|\d{6,})", path, re.I):
+    last_segment = segments[-1] if segments else ""
+    if last_segment and len(segments) <= 3 and re.fullmatch(r"[a-z-]+-\d{4,5}", last_segment) and not re.search(r"(ref-|reference|id-|\d{6,})", path, re.I):
         return False
-    if len(segments) <= 3 and not re.search(r"(ref-|reference|id-|\d{6,}|-[a-z0-9]{10,})", path, re.I):
+    if segments and len(segments) <= 3 and not re.search(r"(ref-|reference|id-|\d{6,}|-[a-z0-9]{10,})", path, re.I):
         return False
 
     include_terms = (
@@ -449,7 +707,7 @@ def _extract_reference_id(url: str, text: str, soup: BeautifulSoup) -> str:
     return ""
 
 
-async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listing:
+async def extract_listing_data(url: str, html: str, domain_info: dict, client: httpx.AsyncClient | None = None) -> Listing:
     soup = BeautifulSoup(html, 'html.parser')
     text = soup.get_text(separator=' ', strip=True)
     title = soup.title.string.lower() if soup.title and soup.title.string else ""
@@ -513,7 +771,7 @@ async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listin
                 bedrooms = str(max(0, r_val - 1))
 
     # 9. DPE Rating - More robust regex
-    dpe_rating = _extract_dpe_rating(soup, html)
+    dpe_rating = await _extract_dpe_rating_with_ocr(soup, html, url, client)
 
     # --- PHASE 3 TARGETS ---
 
@@ -563,6 +821,10 @@ async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listin
     if not clean_phone:
         clean_phone = _normalize_phone(str(domain_info.get('phone', '')).strip())
 
+    agency_name = str(domain_info.get('agency_name', '')).strip()
+    if not agency_name or agency_name.lower() in {"unknown agency", "unknown"}:
+        agency_name = _extract_agency_name(soup, domain_info)
+
     return Listing(
         reference_id=reference_id,
         domain=domain_info['domain'],
@@ -573,7 +835,7 @@ async def extract_listing_data(url: str, html: str, domain_info: dict) -> Listin
         surface_area=surface_area,
         rooms=rooms,
         bedrooms=bedrooms,
-        agency_name=domain_info.get('agency_name', ''),
+        agency_name=agency_name,
         phone=clean_phone,
         email=email,
         coordinates=coordinates,
@@ -680,7 +942,7 @@ async def extract_listings_from_domain(domain_info: Dict[str, Any], client: http
             if not page_html:
                 return None
 
-            listing = await extract_listing_data(listing_url, page_html, domain_info)
+            listing = await extract_listing_data(listing_url, page_html, domain_info, client=client)
 
             # Apply agency email fallback
             if not listing.email:
