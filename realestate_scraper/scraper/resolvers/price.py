@@ -75,10 +75,14 @@ def _is_per_m2(candidate: str) -> bool:
     return bool(_M2_NOISE.search(candidate or ""))
 
 
-def _accept(candidate: str) -> str:
+def _accept(candidate: str, *, surrounding: str = "") -> str:
     if not candidate or _ON_REQUEST.search(candidate):
         return ""
-    if _is_per_m2(candidate):
+    # The per-m2 guard runs against both the candidate and the
+    # surrounding text. Path 5 (`find_euro_amounts`) captures only the
+    # digit fragment, so the per-m2 marker is in the surrounding text,
+    # not in the candidate itself.
+    if _is_per_m2(candidate) or (surrounding and _is_per_m2(surrounding)):
         return ""
     if "€" not in candidate and not re.search(r"(prix|price)", candidate, re.IGNORECASE):
         return ""
@@ -116,9 +120,11 @@ class PriceResolver:
             if cleaned:
                 return ResolverResult(cleaned, 0.7, "label")
 
-        # 5. Trailing euro amounts
+        # 5. Trailing euro amounts. Pass `ctx.text` as surrounding so
+        # the per-m2 guard sees the rate marker even though the
+        # captured fragment is just digits.
         for candidate in find_euro_amounts(ctx.text):
-            cleaned = _accept(candidate + " €")
+            cleaned = _accept(candidate + " €", surrounding=ctx.text)
             if cleaned:
                 return ResolverResult(cleaned, 0.55, "euro")
 

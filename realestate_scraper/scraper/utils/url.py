@@ -20,8 +20,12 @@ def ensure_scheme(url: str, default_scheme: str = "https") -> str:
     value = str(url).strip()
     if not value or value.lower() in {"nan", "none", "null"}:
         return ""
-    if value.startswith(("http://", "https://")):
-        return value
+    lowered = value.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        # Normalise scheme casing per RFC 3986 §3.1; leave host+path
+        # untouched (host is normalised elsewhere via urlparse().netloc).
+        scheme_end = value.index("://")
+        return value[:scheme_end].lower() + value[scheme_end:]
     return f"{default_scheme}://{value.lstrip('/')}"
 
 
