@@ -24,13 +24,28 @@ _PATTERN_LOOSE = re.compile(
 def _normalize(raw: str) -> str:
     if not raw:
         return ""
+    original = raw
     cleaned = raw.replace("\xa0", " ").strip()
     cleaned = cleaned.replace(" ", "")
+    has_comma = "," in cleaned
     cleaned = cleaned.replace(",", ".")
     if cleaned.count(".") > 1:
-        # Remove thousand separators that ended up as dots.
+        # Multi-dot: rightmost dot is the decimal separator, the rest
+        # are thousand separators (e.g. "1.302,50" -> "1.302.50" -> "1302.50").
         whole, _, fraction = cleaned.rpartition(".")
         cleaned = whole.replace(".", "") + "." + fraction
+    elif (
+        cleaned.count(".") == 1
+        and not has_comma
+        and "," not in original
+    ):
+        # Single-dot, no comma anywhere: ambiguous between decimal
+        # (`90.76`) and thousand separator (`1.302`). The convention in
+        # French listings is dot-as-thousand-separator when followed by
+        # exactly three digits.
+        whole, _, fraction = cleaned.partition(".")
+        if len(fraction) == 3 and fraction.isdigit() and whole.isdigit():
+            cleaned = whole + fraction
     if not cleaned:
         return ""
     if cleaned.startswith("."):
