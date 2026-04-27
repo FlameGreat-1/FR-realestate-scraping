@@ -81,3 +81,34 @@ def both_www_variants(url: str) -> tuple[str, str]:
         urlunparse((parsed.scheme, www, *rest)),
         urlunparse((parsed.scheme, bare, *rest)),
     )
+
+
+def probe_variants(url: str) -> list[str]:
+    """Deterministic, deduplicated probe order: https/www -> http/bare.
+
+    The order is chosen to maximise the chance of a fast hit on modern
+    sites (HTTPS+www) while still recovering legacy or misconfigured
+    sites that only answer on plain http or on the bare host. The list
+    is bounded to four entries, so a probe never costs more than four
+    HEAD/GET attempts.
+    """
+    if not url:
+        return []
+    parsed = urlparse(ensure_scheme(url))
+    host = parsed.netloc.lower()
+    if not host:
+        return []
+    bare = host[4:] if host.startswith("www.") else host
+    www = host if host.startswith("www.") else f"www.{host}"
+    path = parsed.path or "/"
+    rest = (path, parsed.params, parsed.query, "")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for scheme in ("https", "http"):
+        for hostname in (www, bare):
+            candidate = urlunparse((scheme, hostname, *rest))
+            if candidate not in seen:
+                seen.add(candidate)
+                out.append(candidate)
+    return out

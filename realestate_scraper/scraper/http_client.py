@@ -4,25 +4,46 @@ A single `httpx.AsyncClient` is reused across the entire run for
 connection pooling and HTTP/2 multiplexing. We never construct ad-hoc
 clients deep inside the codebase: the pipeline owns the lifecycle, and
 the rest of the system receives a `HttpFetcher` handle.
+
+Anti-block layer:
+    * Per-host User-Agent and client-hint headers are picked
+      deterministically from a small curated pool (`headers.py`) so
+      different domains get different fingerprints without breaking
+      HTTP/2 reuse for any individual host.
+    * On 403/429 the fetcher retries exactly once with a rotated
+      profile before giving up; further fallback (Playwright) is
+      handled higher up the stack.
 """
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Mapping, Optional
 
 import httpx
 
 from .config import Settings
+from .headers import (
+    BrowserProfile,
+    build_headers,
+    profile_for_url,
+    rotated_profile,
+)
 from .utils.ratelimit import HostLimiter
 from .utils.retry import with_retry
+from .utils.url import probe_variants
 
 log = logging.getLogger(__name__)
 
 _NON_HTML_PREFIXES = (
     "image/", "video/", "audio/", "font/", "application/pdf",
     "application/zip", "application/octet-stream",
+)
+_BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 429})
+_DEFAULT_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "image/avif,image/webp,*/*;q=0.8"
 )
 
 
@@ -56,6 +77,18 @@ class FetchOutcome:
         )
 
 
+@dataclass(slots=True)
+class ProbeResult:
+    """Reachability probe outcome across one or more URL variants."""
+
+    status_code: Optional[int]
+    final_url: str
+
+    @property
+    def reachable(self) -> bool:
+        return self.status_code is not None
+
+
 class HttpFetcher:
     """Thin facade around `httpx.AsyncClient` that adds limits and retries."""
 
@@ -68,6 +101,7 @@ class HttpFetcher:
         retry_backoff: float,
         probe_timeout: float,
         fetch_timeout: float,
+        accept_language: str,
     ) -> None:
         self._client = client
         self._limiter = host_limiter
@@ -75,20 +109,60 @@ class HttpFetcher:
         self._retry_backoff = retry_backoff
         self._probe_timeout = probe_timeout
         self._fetch_timeout = fetch_timeout
+        self._accept_language = accept_language
 
     @property
     def client(self) -> httpx.AsyncClient:
         return self._client
 
-    async def probe(self, url: str) -> Optional[int]:
-        """Cheap reachability probe: try HEAD, fall back to GET."""
+    @property
+    def probe_timeout(self) -> float:
+        return self._probe_timeout
+
+    def headers_for(
+        self,
+        url: str,
+        *,
+        attempt: int = 0,
+    ) -> dict[str, str]:
+        """Build the request headers for `url`.
+
+        `attempt=0` returns the primary profile for the host;
+        `attempt>=1` rotates to a different profile (used after a 403).
+        """
+        profile: BrowserProfile = (
+            profile_for_url(url)
+            if attempt <= 0
+            else rotated_profile(url, attempt)
+        )
+        return build_headers(
+            profile,
+            accept=_DEFAULT_ACCEPT,
+            accept_language=self._accept_language,
+        )
+
+    async def probe(self, url: str) -> ProbeResult:
+        """Reachability probe with www/scheme variant fallback."""
         if not url:
-            return None
+            return ProbeResult(status_code=None, final_url=url)
+
+        for candidate in probe_variants(url):
+            status = await self._probe_single(candidate)
+            if status is not None:
+                return ProbeResult(status_code=status, final_url=candidate)
+        return ProbeResult(status_code=None, final_url=url)
+
+    async def _probe_single(self, url: str) -> Optional[int]:
+        """Send one HEAD (then GET) probe to a specific URL."""
+        headers = self.headers_for(url)
         async with self._limiter.slot(url):
             for method in ("HEAD", "GET"):
                 try:
                     response = await self._client.request(
-                        method, url, timeout=self._probe_timeout
+                        method,
+                        url,
+                        timeout=self._probe_timeout,
+                        headers=headers,
                     )
                     return response.status_code
                 except httpx.HTTPError as exc:
@@ -101,7 +175,15 @@ class HttpFetcher:
         url: str,
         *,
         timeout: Optional[float] = None,
+        retry_on_block: bool = True,
     ) -> FetchOutcome:
+        """GET `url` with transient-error retries and optional UA rotation.
+
+        On a 401/403/429 response we retry exactly once with a rotated
+        UA profile before returning the (still-blocked) outcome. The
+        higher-level pipeline decides whether to escalate to dynamic
+        rendering after that.
+        """
         if not url:
             return FetchOutcome(
                 url=url, status=None, text="",
@@ -109,11 +191,47 @@ class HttpFetcher:
                 error=ValueError("empty url"),
             )
 
+        outcome = await self._fetch_with_headers(
+            url,
+            headers=self.headers_for(url),
+            timeout=timeout,
+        )
+        if (
+            retry_on_block
+            and outcome.status in _BLOCK_STATUSES
+        ):
+            rotated = self.headers_for(url, attempt=1)
+            retried = await self._fetch_with_headers(
+                url,
+                headers=rotated,
+                timeout=timeout,
+            )
+            # Prefer the retry only if it produced a usable response;
+            # otherwise return the original block so the pipeline still
+            # classifies it correctly.
+            if retried.ok:
+                return retried
+            if (
+                retried.status is not None
+                and retried.status not in _BLOCK_STATUSES
+            ):
+                return retried
+        return outcome
+
+    async def _fetch_with_headers(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout: Optional[float],
+    ) -> FetchOutcome:
         timeout_value = timeout or self._fetch_timeout
 
         async def _do() -> httpx.Response:
             async with self._limiter.slot(url):
-                return await self._client.get(url, timeout=timeout_value)
+                return await self._client.get(
+                    url, timeout=timeout_value, headers=headers
+                )
 
         try:
             response = await with_retry(
@@ -166,6 +284,10 @@ async def open_fetcher(settings: Settings) -> AsyncIterator[HttpFetcher]:
         http2=True,
     )
 
+    # The client itself does not hold the per-request UA: each call to
+    # `fetch`/`probe` injects its own headers so we can rotate per host.
+    # We still set a sane default header set for any internal httpx
+    # request (e.g. redirect target lookups) that bypass our wrappers.
     async with httpx.AsyncClient(
         headers=settings.default_headers,
         follow_redirects=settings.follow_redirects,
@@ -183,5 +305,6 @@ async def open_fetcher(settings: Settings) -> AsyncIterator[HttpFetcher]:
             retry_backoff=settings.http_retry_backoff,
             probe_timeout=settings.http_probe_timeout,
             fetch_timeout=settings.http_fetch_timeout,
+            accept_language=settings.accept_language,
         )
         yield fetcher

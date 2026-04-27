@@ -16,6 +16,10 @@ _LISTING_TYPES = {
     "apartment", "accommodation", "residence", "realestate",
 }
 
+_AGENT_TYPES = {
+    "realestateagent", "person",
+}
+
 _PRICE_KEYS = ("price", "lowprice", "highprice", "pricevalue")
 _REF_KEYS = ("sku", "productid", "identifier", "ref", "reference", "reference_id")
 _PHONE_KEYS = ("telephone", "phone", "phonenumber")
@@ -23,6 +27,7 @@ _DPE_KEYS = (
     "energyefficiencycategory", "energyclass", "energyrating",
     "dperating", "epcrating", "epccategory",
 )
+_AGENT_PARENT_KEYS = ("author", "seller", "publisher", "provider", "agent")
 
 
 def _iter_scripts(html: str) -> Iterator[str]:
@@ -46,12 +51,40 @@ def _safe_load(raw: str) -> Any:
         return json.loads(raw)
     except Exception:
         # Some sites wrap JSON-LD in HTML comments or trailing commas.
-        cleaned = re.sub(r"^<!--|-->$", "", raw).strip()
+        cleaned = re.sub(r"^$", "", raw).strip()
         cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
         try:
             return json.loads(cleaned)
         except Exception:
             return None
+
+
+def _agent_name_from(value: Any) -> str:
+    """Pull a person-like name from a schema.org agent/seller node.
+
+    Accepts either a string (`"author": "Jean Dupont"`) or a dict with
+    an explicit `@type` of RealEstateAgent / Person, or a dict that
+    simply carries `name` (many CMSes omit @type for agents).
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        node_type = value.get("@type") or value.get("type") or ""
+        node_type_l = (
+            node_type if isinstance(node_type, str) else ""
+        ).lower()
+        if node_type_l and node_type_l not in _AGENT_TYPES:
+            # Organisation/LocalBusiness names are agency-level, not agent-level.
+            return ""
+        name = value.get("name")
+        if isinstance(name, str):
+            return name.strip()
+    if isinstance(value, list):
+        for item in value:
+            picked = _agent_name_from(item)
+            if picked:
+                return picked
+    return ""
 
 
 def _walk(node: Any, out: dict[str, Any]) -> None:
@@ -83,8 +116,23 @@ def _walk(node: Any, out: dict[str, Any]) -> None:
                 out.setdefault("description", value)
             elif kl in ("url", "@id") and isinstance(value, str):
                 out.setdefault("url", value)
+            elif kl in _AGENT_PARENT_KEYS:
+                # `offers.seller`, `author`, etc. carry the agent.
+                # We *also* still recurse so any nested fields surface.
+                if "agent_name" not in out:
+                    candidate = _agent_name_from(value)
+                    if candidate:
+                        out["agent_name"] = candidate
+                if isinstance(value, (dict, list)):
+                    _walk(value, out)
             elif isinstance(value, (dict, list)):
                 _walk(value, out)
+
+        # `RealEstateAgent` may sit at the top of its own JSON-LD block.
+        if node_type_l in _AGENT_TYPES and "agent_name" not in out:
+            name = node.get("name")
+            if isinstance(name, str) and name.strip():
+                out["agent_name"] = name.strip()
     elif isinstance(node, list):
         for item in node:
             _walk(item, out)

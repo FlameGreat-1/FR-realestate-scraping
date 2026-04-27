@@ -108,7 +108,7 @@ def build_listing(ctx: PageContext) -> Listing:
     listing.surface_area = _SURFACE.resolve(ctx).value
     listing.rooms = _ROOMS.resolve(ctx).value
     listing.bedrooms = _BEDROOMS.resolve(ctx).value
-    listing.dpe_rating = _DPE.resolve(ctx).value or "No DPE rating"
+    listing.dpe_rating = _DPE.resolve(ctx).value
     listing.location = _LOCATION.resolve(ctx).value
     listing.coordinates = _COORDS.resolve(ctx).value
     listing.phone_number = _PHONE.resolve(ctx).value

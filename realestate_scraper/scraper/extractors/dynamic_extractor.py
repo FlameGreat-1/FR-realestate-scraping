@@ -90,7 +90,7 @@ class DynamicExtractor:
 
         async def _process(url: str) -> Listing | None:
             try:
-                async with self._pool.page() as page:
+                async with self._pool.page(target_url=url) as page:
                     response = await page.goto(
                         url, wait_until="domcontentloaded", timeout=nav_timeout_ms
                     )
@@ -133,7 +133,7 @@ class DynamicExtractor:
         urls: list[str] = []
         nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
         try:
-            async with self._pool.page() as page:
+            async with self._pool.page(target_url=job.url) as page:
                 response = await page.goto(
                     job.url,
                     wait_until="domcontentloaded",

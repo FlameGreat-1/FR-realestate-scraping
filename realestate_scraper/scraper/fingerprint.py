@@ -84,18 +84,24 @@ async def fingerprint_site(
     fetcher: HttpFetcher,
 ) -> Fingerprint:
     host = parse_host(url)
-    probe_status = await fetcher.probe(url)
+    probe = await fetcher.probe(url)
+    probe_status = probe.status_code
     failure_from_probe = classify_http_status(probe_status)
+
+    # Use whichever variant actually answered as the basis for the
+    # homepage GET, so we don't waste time re-probing a non-answering
+    # host/scheme combo.
+    effective_url = probe.final_url or url
 
     homepage_status: Optional[int] = None
     homepage_html = ""
-    final_url = url
+    final_url = effective_url
     homepage_failure: Optional[ErrorReason] = None
 
     if failure_from_probe is None or failure_from_probe == ErrorReason.BLOCKED_403:
-        outcome = await fetcher.fetch(url)
+        outcome = await fetcher.fetch(effective_url)
         homepage_status = outcome.status
-        final_url = outcome.final_url or url
+        final_url = outcome.final_url or effective_url
         if outcome.ok and outcome.is_html_like:
             homepage_html = outcome.text[:_HEAD_BYTES]
         else:
@@ -130,7 +136,7 @@ async def fingerprint_site(
     )
 
     return Fingerprint(
-        url=url,
+        url=effective_url,
         host=host,
         probe_status=probe_status,
         homepage_status=homepage_status,
