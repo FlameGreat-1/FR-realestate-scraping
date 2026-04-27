@@ -17,6 +17,7 @@ import httpx
 from .config import Settings
 from .utils.ratelimit import HostLimiter
 from .utils.retry import with_retry
+from .utils.url import probe_variants
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,18 @@ class FetchOutcome:
         )
 
 
+@dataclass(slots=True)
+class ProbeResult:
+    """Reachability probe outcome across one or more URL variants."""
+
+    status_code: Optional[int]
+    final_url: str
+
+    @property
+    def reachable(self) -> bool:
+        return self.status_code is not None
+
+
 class HttpFetcher:
     """Thin facade around `httpx.AsyncClient` that adds limits and retries."""
 
@@ -80,10 +93,30 @@ class HttpFetcher:
     def client(self) -> httpx.AsyncClient:
         return self._client
 
-    async def probe(self, url: str) -> Optional[int]:
-        """Cheap reachability probe: try HEAD, fall back to GET."""
+    @property
+    def probe_timeout(self) -> float:
+        return self._probe_timeout
+
+    async def probe(self, url: str) -> ProbeResult:
+        """Reachability probe with www/scheme variant fallback.
+
+        Walks a small deterministic set of URL variants (www/bare and
+        https/http) and returns as soon as any variant produces an HTTP
+        response. This is what stops perfectly-reachable sites being
+        misclassified as `site_not_reachable` because the input row
+        happened to be the wrong host or scheme.
+        """
         if not url:
-            return None
+            return ProbeResult(status_code=None, final_url=url)
+
+        for candidate in probe_variants(url):
+            status = await self._probe_single(candidate)
+            if status is not None:
+                return ProbeResult(status_code=status, final_url=candidate)
+        return ProbeResult(status_code=None, final_url=url)
+
+    async def _probe_single(self, url: str) -> Optional[int]:
+        """Send one HEAD (then GET) probe to a specific URL."""
         async with self._limiter.slot(url):
             for method in ("HEAD", "GET"):
                 try:
