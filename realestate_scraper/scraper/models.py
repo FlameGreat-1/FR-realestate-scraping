@@ -95,18 +95,27 @@ class Listing:
         return asdict(self)
 
     def is_publishable(self) -> bool:
-        """A listing is worth emitting if price + at least one descriptor is set."""
-        if not (self.price or "").strip():
-            return False
-        descriptors = (
-            self.reference_id,
-            self.property_type,
+        """A listing qualifies when at least two informative fields are set.
+
+        Informative fields are the six the brief uses to describe a
+        property:
+
+            price, location, surface_area, rooms, reference_id, property_type
+
+        Agency/agent metadata is intentionally excluded because it
+        propagates from the input CSV and would otherwise let any
+        parsed page through.
+        """
+        informative = (
+            self.price,
             self.location,
             self.surface_area,
             self.rooms,
-            self.bedrooms,
+            self.reference_id,
+            self.property_type,
         )
-        return any((d or "").strip() for d in descriptors)
+        filled = sum(1 for value in informative if (value or "").strip())
+        return filled >= 2
 
 
 @dataclass(slots=True)
