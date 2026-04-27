@@ -3,23 +3,41 @@
 French DPE labels are letters A-G. We only accept *labelled*
 appearances to avoid catching standalone single letters in unrelated
 text.
+
+Sources, in order of confidence:
+    1. JSON-LD `dpe` (already normalised by `utils.json_ld`).
+    2. Inline `data-dpe` / `data-classe-energie` attributes.
+    3. Image `alt` attributes carrying the rating in human text.
+    4. Labelled inline text (DPE, Diagnostic, Classe énergie,
+       Étiquette énergie, Consommation, DPE collectif, ...).
+
+Numeric `kWh/m².an` thresholds are intentionally not converted to
+class letters - the regulatory mapping depends on climate zone, so
+doing it here risks silently mis-labelling listings.
 """
 from __future__ import annotations
 
 import re
+from typing import Optional
+
+from selectolax.parser import HTMLParser
 
 from ..models import PageContext, ResolverResult
 from ..utils.text import normalize_for_match
 
 _LABELLED = (
-    re.compile(r"\bdpe\b\s*[:\-]?\s*(?:classe\s*)?([A-G])\b", re.IGNORECASE),
+    re.compile(
+        r"\bdpe(?:\s+collectif)?\b\s*[:\-]?\s*(?:classe\s*)?([A-G])\b",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"\bdiagnostic(?:\s+de\s+performance)?(?:\s+energetique)?\b\s*"
         r"[:\-]?\s*(?:classe\s*)?([A-G])\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bclasse(?:ment)?(?:\s+energie|\s+energetique)?\b\s*[:\-]?\s*([A-G])\b",
+        r"\b(?:classe(?:ment)?|etiquette)"
+        r"(?:\s+energie|\s+energetique)?\b\s*[:\-]?\s*([A-G])\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -27,6 +45,60 @@ _LABELLED = (
         re.IGNORECASE,
     ),
 )
+
+_DATA_ATTR_NAMES = (
+    "data-dpe",
+    "data-classe-energie",
+    "data-classe-dpe",
+    "data-energy-class",
+    "data-energie",
+)
+
+_IMG_ALT_PATTERN = re.compile(
+    r"(?:dpe|etiquette\s+energie|classe\s+energie)[\s\-:]*(?:lettre\s+)?([A-G])\b",
+    re.IGNORECASE,
+)
+
+_LETTER_RE = re.compile(r"^[A-G]$")
+
+
+def _clean_letter(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    candidate = value.strip().upper()
+    return candidate if _LETTER_RE.match(candidate) else ""
+
+
+def _from_data_attributes(parser: HTMLParser) -> str:
+    selector = ", ".join(f"[{name}]" for name in _DATA_ATTR_NAMES)
+    try:
+        nodes = parser.css(selector)
+    except Exception:
+        return ""
+    for node in nodes:
+        for attr_name in _DATA_ATTR_NAMES:
+            value = node.attributes.get(attr_name)
+            cleaned = _clean_letter(value)
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def _from_image_alts(parser: HTMLParser) -> str:
+    try:
+        nodes = parser.css("img[alt]")
+    except Exception:
+        return ""
+    for node in nodes:
+        alt = node.attributes.get("alt") or ""
+        if not alt:
+            continue
+        match = _IMG_ALT_PATTERN.search(alt)
+        if match:
+            cleaned = _clean_letter(match.group(1))
+            if cleaned:
+                return cleaned
+    return ""
 
 
 class DpeResolver:
@@ -37,7 +109,22 @@ class DpeResolver:
         if isinstance(ld_dpe, str):
             match = re.search(r"\b([A-G])\b", ld_dpe, re.IGNORECASE)
             if match:
-                return ResolverResult(match.group(1).upper(), 0.95, "json_ld")
+                cleaned = _clean_letter(match.group(1))
+                if cleaned:
+                    return ResolverResult(cleaned, 0.95, "json_ld")
+
+        if ctx.html:
+            try:
+                parser = HTMLParser(ctx.html)
+            except Exception:
+                parser = None
+            if parser is not None:
+                value = _from_data_attributes(parser)
+                if value:
+                    return ResolverResult(value, 0.9, "data_attr")
+                value = _from_image_alts(parser)
+                if value:
+                    return ResolverResult(value, 0.8, "img_alt")
 
         if not ctx.text:
             return ResolverResult("", 0.0, "")
@@ -45,6 +132,8 @@ class DpeResolver:
         for pattern in _LABELLED:
             match = pattern.search(normalised)
             if match:
-                return ResolverResult(match.group(1).upper(), 0.85, "label")
+                cleaned = _clean_letter(match.group(1))
+                if cleaned:
+                    return ResolverResult(cleaned, 0.85, "label")
 
         return ResolverResult("", 0.0, "")
