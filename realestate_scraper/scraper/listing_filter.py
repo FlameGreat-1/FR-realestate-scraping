@@ -53,7 +53,8 @@ _HUB_PATHS = {
 _HUB_PATTERNS = re.compile(
     r"(achat-immobilier|vente-immobilier|listing-categorie|prix-m2|"
     r"prix-rues|/search(?:/|$)|/recherche(?:/|$)|/result(?:/|$)|"
-    r"/results(?:/|$)|/biens/result|/produits/all|/annonces?(?:/|$)|"
+    r"/results(?:/|$)|/biens/result|/produits/all|"
+    r"^/annonces/?$|^/annonce/?$|"
     r"^/proprietes/?$|^/properties/?$)",
     re.IGNORECASE,
 )
