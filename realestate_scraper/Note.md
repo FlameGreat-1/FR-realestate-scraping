@@ -149,44 +149,4 @@ I HOPE YOU UNDERSTAND CLEARLY EVERYTHING I SAID?
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-fix(extractors): stop injecting "No DPE rating" placeholder string
-
-`pipeline_extract.build_listing` was forcing `dpe_rating` to the
-literal string `"No DPE rating"` whenever the resolver returned
-empty. That is a placeholder masquerading as data:
-
-  * It pollutes the listings CSV with a non-rating in the rating
-    column. Downstream consumers that filter on `dpe_rating != \"\"`
-    would treat these rows as having a DPE.
-
-  * It silently inflates any fill-rate metric that counts non-empty
-    cells - the baseline `29.1%` figure would have been near 100%
-    if the metric used the same predicate.
-
-  * The brief models DPE as a real-estate rating; an English filler
-    string is neither a rating nor consistent with the other resolved
-    fields (which return empty when unknown).
-
-Fix: assign the resolver's value directly. Empty stays empty, like
-every other field. This is also a precondition for honest accuracy
-measurement after the resolver upgrades land.
-
-
-
---- realestate_scraper/scraper/extractors/pipeline_extract.py
-+++ realestate_scraper/scraper/extractors/pipeline_extract.py
-@@ -1,1 +1,1 @@
--    listing.dpe_rating = _DPE.resolve(ctx).value or "No DPE rating"
-+    listing.dpe_rating = _DPE.resolve(ctx).value
+python -m scraper
