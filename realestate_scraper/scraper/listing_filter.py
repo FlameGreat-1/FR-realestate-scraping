@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 from urllib.parse import urlparse
 
 from .utils.url import canonicalize
@@ -82,6 +83,28 @@ _QUERY_HINTS = re.compile(
 )
 
 _T_NOTATION = re.compile(r"\bt\d\b", re.IGNORECASE)
+
+# Reasons the detail classifier emits when it rejects a URL specifically
+# because it looks like a hub/index. Used by `classify_seed` to decide
+# whether the URL is worth expanding (rather than scraping directly).
+_HUB_REJECTION_REASONS: frozenset[str] = frozenset({
+    "hub_path",
+    "hub_pattern",
+})
+
+
+class SeedKind(str, Enum):
+    """Outcome of seed classification.
+
+    DETAIL: the URL itself is a candidate property page; scrape it.
+    HUB:    the URL is an index/search/category page; fetch it and
+            expand its child anchors as further seeds.
+    REJECT: not useful (asset, social, blog, contact, etc.).
+    """
+
+    DETAIL = "detail"
+    HUB = "hub"
+    REJECT = "reject"
 
 
 @dataclass(slots=True)
@@ -165,6 +188,26 @@ def classify_url(url: str) -> UrlClassification:
         return UrlClassification(-1, "shallow_no_signal")
 
     return UrlClassification(score, ",".join(reason_bits) or "none")
+
+
+def classify_seed(url: str) -> SeedKind:
+    """Classify a URL as a detail page, an expandable hub, or rejected.
+
+    Reuses the same `classify_url` heuristics so we never disagree with
+    the detail-page classifier. Hubs are exactly the URLs that
+    `classify_url` rejects with a hub-shaped reason - we don't add new
+    rules, we just stop throwing that signal away.
+    """
+    if not url:
+        return SeedKind.REJECT
+    if not is_candidate_seed_url(url, base_url=url):
+        return SeedKind.REJECT
+    verdict = classify_url(url)
+    if verdict.accepted:
+        return SeedKind.DETAIL
+    if verdict.reason in _HUB_REJECTION_REASONS:
+        return SeedKind.HUB
+    return SeedKind.REJECT
 
 
 def is_candidate_listing_url(url: str) -> bool:
