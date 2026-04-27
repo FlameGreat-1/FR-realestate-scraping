@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     max_listing_urls_per_domain: int = Field(default=120, ge=1)
     max_seed_urls_per_domain: int = Field(default=80, ge=1)
     max_sitemap_depth: int = Field(default=2, ge=1, le=5)
+    seed_expansion_depth: int = Field(default=2, ge=0, le=4)
+    max_hub_pages_per_domain: int = Field(default=12, ge=0, le=128)
 
     # --- Behaviour ---
     verify_tls: bool = Field(default=False)
