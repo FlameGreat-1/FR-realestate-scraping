@@ -3,9 +3,16 @@
 Design notes:
     * Append-only writers with header initialisation; safe to call from
       many coroutines through an internal `asyncio.Lock`.
-    * In-memory dedup keyed on `(source_domain, reference_id)` falling
-      back to `(source_domain, canonical_url)`. No post-hoc rewrite of
-      the whole file - critical when scaling to 55k+ domains.
+    * In-memory dedup runs three independent key spaces collectively:
+        - `(source_domain, reference_id)`
+        - `(source_domain, canonical_url)`
+        - `(source_domain, content_fingerprint)`
+      A listing is accepted iff every key it can produce is unseen on
+      its domain. Recording happens on accept across all key spaces, so
+      a referenced listing and a reference-less duplicate that share a
+      content fingerprint are correctly collapsed.
+    * No post-hoc rewrite of the whole file - critical when scaling to
+      55k+ domains.
     * Headers and column order are sourced from `models.py` so the brief
       contract has a single point of truth.
 """
@@ -117,44 +124,40 @@ class ListingWriter:
         return len(accepted)
 
     def _register(self, listing: Listing) -> bool:
+        """Decide whether to keep `listing`, recording its keys if so.
+
+        Invariant: a listing is accepted iff every dedup key it can
+        produce is unseen on the same domain. The three tiers are
+        therefore checked collectively, not in isolation - otherwise a
+        listing with a unique URL but a duplicate content fingerprint
+        would be accepted just because tier 2 had not seen its URL
+        before, defeating the purpose of tier 3.
+        """
         domain = (listing.source_domain or "").strip().lower()
-        ref = (listing.reference_id or "").strip()
+        if not domain:
+            return True
+
+        ref = (listing.reference_id or "").strip().lower()
         url_key = dedup_key(listing.source_url)
+        content_key = _content_fingerprint(listing)
 
-        # Tier 1: stable reference id wins outright.
-        if domain and ref:
-            key = (domain, ref.lower())
-            if key in self._seen_ref:
-                return False
-            self._seen_ref.add(key)
-            if url_key:
-                self._seen_url.add((domain, url_key))
-            content_key = _content_fingerprint(listing)
-            if content_key:
-                self._seen_content.add((domain, content_key))
-            return True
+        ref_pair = (domain, ref) if ref else None
+        url_pair = (domain, url_key) if url_key else None
+        content_pair = (domain, content_key) if content_key else None
 
-        # Tier 2: canonical URL collapse.
-        if domain and url_key:
-            key = (domain, url_key)
-            if key in self._seen_url:
-                return False
-            self._seen_url.add(key)
-            content_key = _content_fingerprint(listing)
-            if content_key:
-                self._seen_content.add((domain, content_key))
-            return True
+        if ref_pair and ref_pair in self._seen_ref:
+            return False
+        if url_pair and url_pair in self._seen_url:
+            return False
+        if content_pair and content_pair in self._seen_content:
+            return False
 
-        # Tier 3: content fingerprint catches the rows tiers 1 and 2 leak.
-        if domain:
-            content_key = _content_fingerprint(listing)
-            if content_key:
-                key = (domain, content_key)
-                if key in self._seen_content:
-                    return False
-                self._seen_content.add(key)
-                return True
-
+        if ref_pair:
+            self._seen_ref.add(ref_pair)
+        if url_pair:
+            self._seen_url.add(url_pair)
+        if content_pair:
+            self._seen_content.add(content_pair)
         return True
 
 
