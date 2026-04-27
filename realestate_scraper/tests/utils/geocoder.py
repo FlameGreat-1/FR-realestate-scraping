@@ -67,16 +67,23 @@ async def test_geocoder_cache_load_returns_value_without_calling_backend(
     assert await geocoder.lookup("Bordeaux") == "44.84, -0.58"
 
 
+async def _no_sleep(_delay):  # noqa: D401 - test seam
+    """Drop-in replacement for `asyncio.sleep` that never blocks or recurses."""
+    return None
+
+
 @pytest.mark.asyncio
 async def test_geocoder_cache_persists_new_entries_atomically(
     tmp_path: Path, monkeypatch,
 ):
     cache_path = tmp_path / ".geocode.json"
     backend = _StubBackend({"paris": (48.85, 2.35)})
-    # Skip the 1-second Nominatim citizenship sleep in tests.
+    # Skip the 1-second Nominatim citizenship sleep in tests. We must
+    # not delegate to `asyncio.sleep(0)` here: monkeypatch replaces the
+    # `sleep` attribute on the shared `asyncio` module object, so any
+    # call to `asyncio.sleep` from inside the stub recurses forever.
     monkeypatch.setattr(
-        "scraper.utils.geocoder.asyncio.sleep",
-        lambda _delay: asyncio.sleep(0),
+        "scraper.utils.geocoder.asyncio.sleep", _no_sleep,
     )
     geocoder = _build(cache_path, backend)
 
@@ -109,8 +116,7 @@ async def test_geocoder_cache_persists_misses(
     cache_path = tmp_path / ".geocode.json"
     backend = _StubBackend({})  # always returns None -> miss
     monkeypatch.setattr(
-        "scraper.utils.geocoder.asyncio.sleep",
-        lambda _delay: asyncio.sleep(0),
+        "scraper.utils.geocoder.asyncio.sleep", _no_sleep,
     )
     geocoder = _build(cache_path, backend)
 
