@@ -90,7 +90,7 @@ async def _read_robots_sitemaps(
     for variant in both_www_variants(ensure_scheme(base_url)):
         outcome = await fetcher.fetch(
             urljoin(variant, "/robots.txt"),
-            timeout=fetcher._probe_timeout,  # noqa: SLF001
+            timeout=fetcher.probe_timeout,
         )
         if outcome.ok and outcome.text:
             for match in _SITEMAP_DIRECTIVE.finditer(outcome.text):
