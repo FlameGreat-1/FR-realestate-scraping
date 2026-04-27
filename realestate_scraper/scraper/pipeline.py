@@ -56,25 +56,56 @@ class Pipeline:
             enabled=settings.enable_geocoding,
             user_agent=settings.geocoder_user_agent,
             timeout=settings.geocoder_timeout,
+            cache_path=settings.geocode_cache_path,
         )
-        self._domain_sem = asyncio.Semaphore(settings.domain_concurrency)
 
     async def run(self, jobs: list[DomainJob]) -> None:
+        """Drive a fixed-size worker pool over `jobs`.
+
+        Memory and scheduler cost are bounded by `domain_concurrency`,
+        not by the input size. This is what makes the pipeline scale
+        from 50 domains to 55k+ without changing topology.
+        """
         if not jobs:
             log.warning("no domains to process")
             return
+
+        worker_count = max(1, min(self._settings.domain_concurrency, len(jobs)))
+        # Bound the queue at 2x worker count so the producer applies
+        # back-pressure if the workers fall behind, instead of buffering
+        # the entire job list in memory.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=worker_count * 2)
+
         async with open_fetcher(self._settings) as fetcher:
             browser_pool = BrowserPool(self._settings)
             try:
                 static = StaticExtractor(self._settings, fetcher)
                 dynamic = DynamicExtractor(self._settings, browser_pool)
-                tasks = [
-                    asyncio.create_task(
-                        self._process_one(job, static, dynamic, fetcher)
-                    )
-                    for job in jobs
-                ]
-                await asyncio.gather(*tasks, return_exceptions=False)
+
+                async def _producer() -> None:
+                    for job in jobs:
+                        await queue.put(job)
+                    # One sentinel per worker for graceful shutdown.
+                    for _ in range(worker_count):
+                        await queue.put(None)
+
+                async def _worker() -> None:
+                    while True:
+                        job = await queue.get()
+                        try:
+                            if job is None:
+                                return
+                            await self._process_one(
+                                job, static, dynamic, fetcher,
+                            )
+                        finally:
+                            queue.task_done()
+
+                await asyncio.gather(
+                    _producer(),
+                    *[_worker() for _ in range(worker_count)],
+                    return_exceptions=False,
+                )
             finally:
                 await browser_pool.close()
 
@@ -85,31 +116,30 @@ class Pipeline:
         dynamic: DynamicExtractor,
         fetcher,
     ) -> None:
-        async with self._domain_sem:
-            start = time.perf_counter()
-            try:
-                result = await asyncio.wait_for(
-                    self._scrape_domain(job, static, dynamic, fetcher),
-                    timeout=self._settings.domain_time_budget,
-                )
-            except asyncio.TimeoutError:
-                log.warning("domain %s timed out", job.domain)
-                result = DomainResult(
-                    domain=job.domain,
-                    status=DomainStatus.FAILED,
-                    reason=ErrorReason.SITE_NOT_REACHABLE,
-                    strategy=Strategy.NONE,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("domain %s crashed: %s", job.domain, exc)
-                result = DomainResult(
-                    domain=job.domain,
-                    status=DomainStatus.FAILED,
-                    reason=classify_exception(exc),
-                    strategy=Strategy.NONE,
-                )
-            result.duration_seconds = time.perf_counter() - start
-            await self._finalize(result)
+        start = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(
+                self._scrape_domain(job, static, dynamic, fetcher),
+                timeout=self._settings.domain_time_budget,
+            )
+        except asyncio.TimeoutError:
+            log.warning("domain %s timed out", job.domain)
+            result = DomainResult(
+                domain=job.domain,
+                status=DomainStatus.FAILED,
+                reason=ErrorReason.SITE_NOT_REACHABLE,
+                strategy=Strategy.NONE,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("domain %s crashed: %s", job.domain, exc)
+            result = DomainResult(
+                domain=job.domain,
+                status=DomainStatus.FAILED,
+                reason=classify_exception(exc),
+                strategy=Strategy.NONE,
+            )
+        result.duration_seconds = time.perf_counter() - start
+        await self._finalize(result)
 
     async def _scrape_domain(
         self,

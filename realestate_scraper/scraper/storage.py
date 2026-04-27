@@ -26,7 +26,30 @@ from .models import (
     LISTING_FIELDS,
     Listing,
 )
+from .utils.text import normalize_for_match
 from .utils.url import dedup_key
+
+import hashlib
+
+
+def _content_fingerprint(listing: Listing) -> str:
+    """Stable per-listing content key used as the third dedup tier.
+
+    Built from the resolved descriptor fields we already have on
+    `Listing`. Returns an empty string when there is not enough
+    signal to distinguish two rows - in which case the caller falls
+    back to the previous behaviour and accepts the row.
+    """
+    parts = [
+        normalize_for_match(listing.location),
+        normalize_for_match(listing.property_type),
+        normalize_for_match(listing.surface_area),
+        (listing.price or "").strip(),
+    ]
+    payload = "|".join(part for part in parts if part)
+    if not payload:
+        return ""
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +76,7 @@ class ListingWriter:
         self._lock = asyncio.Lock()
         self._seen_ref: set[tuple[str, str]] = set()
         self._seen_url: set[tuple[str, str]] = set()
+        self._seen_content: set[tuple[str, str]] = set()
         self._written = 0
 
     @property
@@ -97,21 +121,39 @@ class ListingWriter:
         ref = (listing.reference_id or "").strip()
         url_key = dedup_key(listing.source_url)
 
+        # Tier 1: stable reference id wins outright.
         if domain and ref:
             key = (domain, ref.lower())
             if key in self._seen_ref:
                 return False
             self._seen_ref.add(key)
-            if domain and url_key:
+            if url_key:
                 self._seen_url.add((domain, url_key))
+            content_key = _content_fingerprint(listing)
+            if content_key:
+                self._seen_content.add((domain, content_key))
             return True
 
+        # Tier 2: canonical URL collapse.
         if domain and url_key:
             key = (domain, url_key)
             if key in self._seen_url:
                 return False
             self._seen_url.add(key)
+            content_key = _content_fingerprint(listing)
+            if content_key:
+                self._seen_content.add((domain, content_key))
             return True
+
+        # Tier 3: content fingerprint catches the rows tiers 1 and 2 leak.
+        if domain:
+            content_key = _content_fingerprint(listing)
+            if content_key:
+                key = (domain, content_key)
+                if key in self._seen_content:
+                    return False
+                self._seen_content.add(key)
+                return True
 
         return True
 
