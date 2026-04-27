@@ -1,26 +1,40 @@
 """Static (HTTPX-driven) listing extractor.
 
 Responsibilities:
-    * Aggregate candidate listing URLs from sitemap + homepage links.
+    * Aggregate candidate listing URLs from sitemap + homepage links
+      + a bounded BFS expansion of hub/index pages.
     * Filter via `listing_filter.classify_url`, with family-aware boost.
     * Fetch each candidate concurrently (bounded), parse, and emit a
       `Listing` whenever a publishable record is produced.
     * Apply per-domain dedup of canonical URLs to avoid double work.
+
+The hub expansion phase is what unlocks franchise sites that publish
+only hub anchors on the homepage (Laforet, Nestenn, Guy Hoquet,
+Stephane Plaza, MyLogement, ...). It walks at most
+`seed_expansion_depth` levels and `max_hub_pages_per_domain` total
+hub fetches per domain, so the worst-case cost stays predictable at
+55k scale.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from typing import Iterable
 
 from ..config import Settings
 from ..fingerprint import Fingerprint
 from ..http_client import HttpFetcher
-from ..listing_filter import classify_url
+from ..listing_filter import SeedKind, classify_seed, classify_url
 from ..models import DomainJob, Listing
-from ..seed_discovery import harvest_homepage_links
+from ..seed_discovery import _extract_anchor_hrefs, harvest_homepage_links
 from ..sitemap import discover_sitemap_urls
-from ..utils.url import canonicalize, dedup_key, same_registrable_domain
+from ..utils.url import (
+    canonicalize,
+    dedup_key,
+    join_url,
+    same_registrable_domain,
+)
 from .pipeline_extract import build_listing, parse_page
 
 log = logging.getLogger(__name__)
@@ -127,8 +141,6 @@ class StaticExtractor:
             _, homepage_urls = await harvest_homepage_links(job.url, self._fetcher)
         elif fingerprint.homepage_html:
             # Reuse what we already fetched during fingerprinting.
-            from ..seed_discovery import _extract_anchor_hrefs
-            from ..utils.url import join_url, same_registrable_domain
             for href in _extract_anchor_hrefs(fingerprint.homepage_html):
                 absolute = join_url(fingerprint.final_url or job.url, href)
                 if absolute.startswith(("http://", "https://")) and same_registrable_domain(
@@ -136,10 +148,86 @@ class StaticExtractor:
                 ):
                     homepage_urls.append(absolute)
 
-        merged = list(sitemap_urls) + homepage_urls
+        seed_urls = list(sitemap_urls) + homepage_urls
+        expanded = await self._expand_hubs(job, seed_urls)
         return _rank_and_limit(
-            merged,
+            expanded,
             job.url,
             fingerprint.families,
             self._settings.max_listing_urls_per_domain,
         )
+
+    async def _expand_hubs(
+        self,
+        job: DomainJob,
+        seed_urls: Iterable[str],
+    ) -> list[str]:
+        """BFS over hub pages, returning a deduplicated detail-URL set.
+
+        The seed list is partitioned by `classify_seed` into details
+        (kept) and hubs (queued for expansion). Hubs are fetched via
+        the shared HttpFetcher so they benefit from per-host limits,
+        UA rotation, and retries. Two hard budgets bound the walk:
+            * `seed_expansion_depth`     - max BFS levels.
+            * `max_hub_pages_per_domain` - max hub HTML fetches.
+        """
+        max_depth = self._settings.seed_expansion_depth
+        hub_budget = self._settings.max_hub_pages_per_domain
+
+        details: dict[str, str] = {}  # canonical_key -> original url
+        hub_queue: deque[tuple[str, int]] = deque()
+        seen_hubs: set[str] = set()
+
+        def _consider(url: str, depth: int) -> None:
+            if not url or not same_registrable_domain(url, job.url):
+                return
+            kind = classify_seed(url)
+            if kind is SeedKind.REJECT:
+                return
+            canonical = canonicalize(url)
+            key = canonical.lower()
+            if not key:
+                return
+            if kind is SeedKind.DETAIL:
+                details.setdefault(key, canonical)
+                return
+            # SeedKind.HUB
+            if depth > max_depth:
+                return
+            if key in seen_hubs:
+                return
+            seen_hubs.add(key)
+            hub_queue.append((canonical, depth))
+
+        for url in seed_urls:
+            _consider(url, depth=1)
+
+        if max_depth <= 0 or hub_budget <= 0:
+            return list(details.values())
+
+        hubs_fetched = 0
+        while hub_queue and hubs_fetched < hub_budget:
+            hub_url, depth = hub_queue.popleft()
+            hubs_fetched += 1
+            outcome = await self._fetcher.fetch(hub_url)
+            if (
+                not outcome.ok
+                or not outcome.is_html_like
+                or not outcome.text
+            ):
+                continue
+            base = outcome.final_url or hub_url
+            for href in _extract_anchor_hrefs(outcome.text):
+                if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+                    continue
+                absolute = join_url(base, href)
+                if not absolute.startswith(("http://", "https://")):
+                    continue
+                _consider(absolute, depth=depth + 1)
+
+        if hubs_fetched:
+            log.debug(
+                "static: %s expanded %d hub(s) -> %d detail candidates",
+                job.domain, hubs_fetched, len(details),
+            )
+        return list(details.values())
