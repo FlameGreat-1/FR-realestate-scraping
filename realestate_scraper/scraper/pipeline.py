@@ -1,124 +1,283 @@
+"""End-to-end orchestrator.
+
+Responsibilities:
+    * Load and dedupe input domains via `DomainLoader`.
+    * Initialise output writers and the resume checkpoint.
+    * Open a single shared `HttpFetcher` and (optionally) `BrowserPool`.
+    * For each domain, fingerprint -> static -> dynamic fallback,
+      enforcing a per-domain time budget.
+    * Translate every failure mode into one of the six brief-mandated
+      error reason codes.
+    * Stream listings, errors, and the per-domain summary as we go.
+"""
+from __future__ import annotations
+
 import asyncio
-import httpx
-import os
-from .domain_manager import deduplicate_domains
-from .input_paths import resolve_input_csv_path
-from .storage import init_storage, write_listings, write_error
-from .extractors.generic import extract_listings_from_domain
-import dataclasses
+import logging
+import time
+from typing import Optional
 
-CSV_PATH = resolve_input_csv_path()
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-}
+from .browser_pool import BrowserPool
+from .checkpoint import Checkpoint
+from .config import Settings, get_settings
+from .domain_loader import DomainLoader, LoaderError
+from .error_codes import ErrorReason, classify_exception
+from .extractors.dynamic_extractor import DynamicExtractor
+from .extractors.static_extractor import StaticExtractor
+from .fingerprint import Fingerprint, fingerprint_site
+from .http_client import open_fetcher
+from .logging_setup import configure_logging
+from .models import (
+    DomainJob,
+    DomainResult,
+    DomainStatus,
+    Listing,
+    Strategy,
+)
+from .storage import OutputBundle, build_output_bundle
+from .utils.geocoder import AsyncGeocoder
 
-DEFAULT_DOMAIN_CONCURRENCY = max(1, int(os.getenv("SCRAPER_CONCURRENCY", "6")))
+log = logging.getLogger(__name__)
 
 
-async def probe_site(url: str, client: httpx.AsyncClient) -> int | None:
-    for method in ("head", "get"):
-        try:
-            response = await getattr(client, method)(url, timeout=8.0)
-            return response.status_code
-        except Exception:
-            continue
-    return None
+class Pipeline:
+    """Concurrent per-domain orchestrator."""
 
-async def process_domain(domain_info: dict, client: httpx.AsyncClient, semaphore: asyncio.Semaphore):
-    async with semaphore:
-        domain = domain_info['domain']
-        print(f"Processing {domain}...")
-        try:
-            # Phase 1: Heuristic / Fast extraction
-            listings = await extract_listings_from_domain(domain_info, client)
-            
-            # Phase 2: Playwright fallback — but only if site is reachable
-            if not listings:
-                # Quick reachability probe (8s) before spending 40s on Playwright
-                probe_status = await probe_site(domain_info['url'], client)
-                print(f"  -> No listings via fast method for {domain}. Trying Playwright...")
-                from .extractors.playwright_extractor import extract_listings_playwright
-                listings = await extract_listings_playwright(domain_info)
-            
-            if not listings:
-                if probe_status in (401, 403):
-                    write_error(
-                        domain,
-                        "blocked",
-                        f"HTTP probe returned {probe_status}; Playwright also found no usable listings",
+    def __init__(
+        self,
+        settings: Settings,
+        bundle: OutputBundle,
+        checkpoint: Checkpoint,
+    ) -> None:
+        self._settings = settings
+        self._bundle = bundle
+        self._checkpoint = checkpoint
+        self._geocoder = AsyncGeocoder(
+            enabled=settings.enable_geocoding,
+            user_agent=settings.geocoder_user_agent,
+            timeout=settings.geocoder_timeout,
+        )
+        self._domain_sem = asyncio.Semaphore(settings.domain_concurrency)
+
+    async def run(self, jobs: list[DomainJob]) -> None:
+        if not jobs:
+            log.warning("no domains to process")
+            return
+        async with open_fetcher(self._settings) as fetcher:
+            browser_pool = BrowserPool(self._settings)
+            try:
+                static = StaticExtractor(self._settings, fetcher)
+                dynamic = DynamicExtractor(self._settings, browser_pool)
+                tasks = [
+                    asyncio.create_task(
+                        self._process_one(job, static, dynamic, fetcher)
                     )
-                elif probe_status == 429:
-                    write_error(
-                        domain,
-                        "rate_limited",
-                        "HTTP probe returned 429; site appears rate-limited but Playwright also found no usable listings",
-                    )
-                elif probe_status is None or probe_status >= 500:
-                    write_error(domain, "unreachable", "Site did not respond to HTTP probe and Playwright found no usable listings")
-                else:
-                    write_error(domain, "no_listings", "Could not find listings on site with either method")
-                return
+                    for job in jobs
+                ]
+                await asyncio.gather(*tasks, return_exceptions=False)
+            finally:
+                await browser_pool.close()
 
-            listings = [listing for listing in listings if getattr(listing, "price", "").strip()]
+    async def _process_one(
+        self,
+        job: DomainJob,
+        static: StaticExtractor,
+        dynamic: DynamicExtractor,
+        fetcher,
+    ) -> None:
+        async with self._domain_sem:
+            start = time.perf_counter()
+            try:
+                result = await asyncio.wait_for(
+                    self._scrape_domain(job, static, dynamic, fetcher),
+                    timeout=self._settings.domain_time_budget,
+                )
+            except asyncio.TimeoutError:
+                log.warning("domain %s timed out", job.domain)
+                result = DomainResult(
+                    domain=job.domain,
+                    status=DomainStatus.FAILED,
+                    reason=ErrorReason.SITE_NOT_REACHABLE,
+                    strategy=Strategy.NONE,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("domain %s crashed: %s", job.domain, exc)
+                result = DomainResult(
+                    domain=job.domain,
+                    status=DomainStatus.FAILED,
+                    reason=classify_exception(exc),
+                    strategy=Strategy.NONE,
+                )
+            result.duration_seconds = time.perf_counter() - start
+            await self._finalize(result)
+
+    async def _scrape_domain(
+        self,
+        job: DomainJob,
+        static: StaticExtractor,
+        dynamic: DynamicExtractor,
+        fetcher,
+    ) -> DomainResult:
+        log.info("start %s", job.domain)
+        fingerprint = await fingerprint_site(job.url, fetcher)
+
+        if (
+            fingerprint.failure_reason == ErrorReason.SITE_NOT_REACHABLE
+            and fingerprint.suggested_strategy == Strategy.NONE
+        ):
+            return DomainResult(
+                domain=job.domain,
+                status=DomainStatus.FAILED,
+                reason=ErrorReason.SITE_NOT_REACHABLE,
+                strategy=Strategy.NONE,
+            )
+
+        listings: list[Listing] = []
+        used = Strategy.NONE
+
+        if fingerprint.suggested_strategy == Strategy.STATIC:
+            listings = await static.gather_listings(job, fingerprint)
+            used = Strategy.STATIC
             if not listings:
-                write_error(domain, "no_price", "Listings were found but no reliable price could be extracted")
-                return
-                
-            # Convert to dicts for CSV
-            listings_dicts = [dataclasses.asdict(l) for l in listings]
-            write_listings(listings_dicts)
-            print(f"  -> Found {len(listings)} listings for {domain}")
-            
-        except httpx.RequestError as e:
-            write_error(domain, "failed", str(e))
-            print(f"  -> Failed (Network): {e}")
-        except Exception as e:
-            write_error(domain, "error", str(e))
-            print(f"  -> Error: {e}")
+                # Static run yielded nothing - try dynamic if available.
+                listings = await self._try_dynamic(job, dynamic, fingerprint)
+                if listings:
+                    used = Strategy.HYBRID
+        else:
+            listings = await self._try_dynamic(job, dynamic, fingerprint)
+            used = Strategy.DYNAMIC if listings else Strategy.NONE
+            if not listings and fingerprint.failure_reason != ErrorReason.BLOCKED_403:
+                # Last-ditch static attempt for misclassified sites.
+                static_listings = await static.gather_listings(job, fingerprint)
+                if static_listings:
+                    listings = static_listings
+                    used = Strategy.STATIC
 
-async def run_pipeline(limit=None):
-    from .storage import deduplicate_final_csv
-    init_storage()
-    if not CSV_PATH.exists():
-        print(f"CSV missing: {CSV_PATH}")
+        if not listings:
+            reason = self._reason_for_empty(fingerprint, dynamic.is_available)
+            return DomainResult(
+                domain=job.domain,
+                status=DomainStatus.FAILED,
+                reason=reason,
+                strategy=used,
+            )
+
+        await self._enrich(listings)
+        accepted = await self._bundle.listings.write_many(listings)
+        return DomainResult(
+            domain=job.domain,
+            status=DomainStatus.SUCCESS,
+            listing_count=accepted,
+            strategy=used,
+        )
+
+    async def _try_dynamic(
+        self,
+        job: DomainJob,
+        dynamic: DynamicExtractor,
+        fingerprint: Fingerprint,
+    ) -> list[Listing]:
+        if not dynamic.is_available:
+            return []
+        try:
+            return await dynamic.gather_listings(job, fingerprint)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("dynamic extractor crashed for %s: %s", job.domain, exc)
+            return []
+
+    @staticmethod
+    def _reason_for_empty(
+        fingerprint: Fingerprint, dynamic_available: bool
+    ) -> ErrorReason:
+        if fingerprint.failure_reason == ErrorReason.BLOCKED_403:
+            return ErrorReason.BLOCKED_403
+        if fingerprint.suggested_strategy == Strategy.DYNAMIC and not dynamic_available:
+            return ErrorReason.DYNAMIC_JS_REQUIRED
+        if fingerprint.failure_reason == ErrorReason.SITE_NOT_REACHABLE:
+            return ErrorReason.SITE_NOT_REACHABLE
+        return ErrorReason.NO_LISTINGS_FOUND
+
+    async def _enrich(self, listings: list[Listing]) -> None:
+        if not self._geocoder.enabled:
+            return
+        for listing in listings:
+            if listing.coordinates or not listing.location:
+                continue
+            value = await self._geocoder.lookup(listing.location)
+            if value:
+                listing.coordinates = value
+
+    async def _finalize(self, result: DomainResult) -> None:
+        await self._bundle.summary.record(result)
+        if result.reason is not None:
+            await self._bundle.errors.record(
+                result.domain,
+                result.reason,
+                status=result.status.value,
+            )
+        await self._checkpoint.mark(result.domain)
+        log.info(
+            "done %s status=%s listings=%d strategy=%s reason=%s in %.1fs",
+            result.domain,
+            result.status.value,
+            result.listing_count,
+            result.strategy.value,
+            result.reason.value if result.reason else "",
+            result.duration_seconds,
+        )
+
+
+async def run_pipeline(
+    *,
+    limit: Optional[int] = None,
+    truncate_outputs: bool = True,
+    reset_checkpoint: bool = False,
+) -> None:
+    """Top-level entrypoint used by `run_scraper.py` and `run_production.py`."""
+    settings = get_settings()
+    configure_logging(level=settings.log_level, json_format=settings.log_json)
+
+    bundle = build_output_bundle(
+        listings_path=settings.listings_csv_path,
+        errors_path=settings.error_log_csv_path,
+        summary_path=settings.domain_summary_csv_path,
+    )
+    await bundle.initialize(truncate=truncate_outputs)
+
+    checkpoint = Checkpoint(settings.checkpoint_path, enabled=settings.resume)
+    if reset_checkpoint:
+        await checkpoint.reset()
+    await checkpoint.load()
+
+    try:
+        loader = DomainLoader(settings.input_csv_path)
+        jobs, no_website = loader.load()
+    except LoaderError as exc:
+        log.error("input load failed: %s", exc)
         return
-        
-    domains_map, no_website_entries = deduplicate_domains(str(CSV_PATH))
-    print(f"Deduplicated to {len(domains_map)} unique domains out of original CSV.")
-    
-    # Log entries with no website as requested
-    for agency in no_website_entries:
-        write_error(agency, "no_website", "Initial input had no website URL")
-    
-    domains_list = list(domains_map.values())
-    if limit is not None:
-        domains_list = domains_list[:limit]
-        
-    # Bounded concurrency: keep several domains in flight without overloading
-    # the HTTP/Playwright stack. Lower defaults usually improve first-result time
-    # and reduce rate limiting on real estate sites.
-    print(f"Using domain concurrency: {DEFAULT_DOMAIN_CONCURRENCY}")
-    semaphore = asyncio.Semaphore(DEFAULT_DOMAIN_CONCURRENCY)
-    
-    async with httpx.AsyncClient(
-        verify=False,
-        timeout=20.0,
-        follow_redirects=True,
-        headers=DEFAULT_HEADERS,
-    ) as client:
-        # We run all processed domains concurrently now with the semaphore
-        tasks = [process_domain(d, client, semaphore) for d in domains_list if d.get('domain')]
-        await asyncio.gather(*tasks)
-    
-    # Final step: Global Deduplication
-    print("\nExecuting global deduplication cleanup...")
-    deduplicate_final_csv()
 
-if __name__ == "__main__":
-    asyncio.run(run_pipeline())
+    for agency in no_website:
+        await bundle.errors.record(
+            (agency or "unknown").lower(),
+            ErrorReason.NO_WEBSITE,
+            status="failed",
+        )
+
+    pending = [job for job in jobs if not checkpoint.has(job.domain)]
+    log.info(
+        "loaded %d jobs (%d pending after checkpoint)",
+        len(jobs), len(pending),
+    )
+    if limit is not None:
+        pending = pending[:limit]
+
+    if not pending:
+        log.info("nothing to do")
+        return
+
+    pipeline = Pipeline(settings, bundle, checkpoint)
+    await pipeline.run(pending)
+    log.info(
+        "finished: %d listings written",
+        bundle.listings.written,
+    )
