@@ -1,54 +1,150 @@
 # Real Estate Listing Scraper
 
-A robust, two-phased, asynchronous web scraper designed to extract a unified database of property listings from thousands of real estate agencies. 
+A scalable, asynchronous Python scraper that extracts a structured
+database of property listings from a CSV of real estate agency
+websites. Built for the Sheba-X 50-domain test brief and engineered
+to scale unchanged to the 55k+ domain target.
 
-## 🏗️ Architecture
+## Output contract
 
-The pipeline processes input CSVs through a rigorous deduplication process and automatically assigns individual domains to highly targeted extraction modules.
+The scraper writes three CSVs into `output/` (configurable):
 
-### Component Breakdown
-* `domain_manager.py`: Deduplicates input rows directly into unique domains to prevent overlapping loads. Merges any missing default agency contact info. 
-* `storage.py`: Generates the structured output (`listings_consolidated.csv` for data points and `error_log.csv` for reporting failures).
-* `extractors/base.py`: Unifies the scraped variables to a structured `Listing` dataclass model format.
+* `listings_consolidated.csv` - one row per deduplicated property
+  listing. Exact columns required by the brief, in this order:
 
-To ensure both maximum speed **and** maximum completion, the scraper operates in two distinct phases:
+  ```
+  reference_id, price, property_type, location, surface_area, rooms,
+  bedrooms, agency_name, agent_name, phone_number, email, coordinates,
+  dpe_rating, source_url, source_domain
+  ```
 
-### Phase 1: High-Speed Static Execution (`run_scraper.py`)
-This runs the primary `HTTPX` payload handler. It actively scans remote servers for index paths and `sitemap.xml` entries, crawling through raw backend HTML. 
+* `error_log.csv` - one row per domain that failed or yielded no
+  listings. Columns: `domain, status, reason`. The `reason` value is
+  always one of the six the brief mandates:
 
-* **JSON-LD Prioritization:** Intelligently extracts deeply embedded schema protocols (like `@type: Product`) for highly accurate pricing variables, rendering localized CSS patterns mostly obsolete.
-* **Strict URL Execution:** Leverages strict nested regex bounding on `.path` endpoints to deliberately void false positive articles and corporate blog queries natively.
-* **Outputs**: All failed sites, JavaScript-dependent sites, and Cloudflare-blocked nodes are dumped automatically to the root `error_log.csv`. 
+  ```
+  no_website, no_listings_found, site_not_reachable,
+  blocked_403, dynamic_js_required, parsing_failed
+  ```
 
-### Phase 2: Dynamic JS Hand-off (`python -m scraper.pipeline_playwright`)
-Bypassing manual curation completely, this pipeline ingests the `error_log.csv` failures and routes them dynamically through an automated, headless Chromium browser instance via **Playwright**.
+* `domain_status_summary.csv` - per-domain timing and strategy
+  diagnostics, useful for evaluation and tuning.
 
-* Rendered data triggers, Cloudflare intercepts, and hidden payload logic are automatically bypassed.
-* **Phone Recognition Engine:** Deploys strict regex evaluation loops across the dynamically updated `document.body.innerText` to reveal hidden telephony endpoints standardizing to `+33` protocols. 
+## Architecture
 
-## 🚀 Execution Guide
+A single async pipeline drives every domain through the same
+stateless flow:
 
-1. Place your target file containing your target domains named `FR_realestate_scraping - FR 140 (1).csv` inside the parent directory (`c:/Users/abcre/Desktop/Project/F_realestate/`).
-
-> [!NOTE]
-> The target location paths can be customized globally by altering `CSV_PATH` inside `scraper/pipeline.py` and `scraper/pipeline_playwright.py`.
-
-### Step 1: Run Core Extraction
-Run the ultra-fast static `HTTPX` scanner across all available domains to extract up to 60% of all simple websites instantly.
-
-```bash
-python run_scraper.py
+```
+fingerprint  ->  static extractor  -- empty? -->  dynamic extractor
+   |                  |                                    |
+   |                  +--- bounded BFS over hub/index pages
+   |                                                       |
+   +-> reachable / blocked / static / dynamic strategy ->  +--> resolvers --> Listing
 ```
 
-### Step 2: Rescue Blocked Domains
-Once Phase 1 completes, initialize the secondary crawler to intercept all failed inputs. 
+Key building blocks:
+
+* `pipeline.py` - bounded async worker pool (`domain_concurrency`
+  workers + a back-pressured queue). Memory is `O(workers)`, not
+  `O(domains)`, so the same code runs at 50 and 55k.
+
+* `fingerprint.py` - per-domain reachability probe with `www`/bare and
+  `https`/`http` variant fallback. Decides whether the domain needs
+  the static path, the dynamic path, or is unreachable.
+
+* `http_client.py` + `headers.py` - shared `httpx.AsyncClient` with
+  HTTP/2, per-host concurrency limits, deterministic per-domain UA
+  rotation, modern client-hint headers (`Sec-CH-UA`, `Sec-Fetch-*`),
+  bounded retries, and a single 403/429 retry with a rotated UA from
+  the pool.
+
+* `extractors/static_extractor.py` - candidate URL collection from
+  sitemap + homepage links + bounded BFS expansion of hub/index pages
+  (depth and total-fetch budgets are config-driven). The classifier
+  in `listing_filter.py` distinguishes detail / hub / reject so
+  franchise hubs (Laforet, Nestenn, Guy Hoquet, Stephane Plaza, ...)
+  produce real detail URLs instead of being thrown away.
+
+* `extractors/dynamic_extractor.py` - Playwright fallback for sites
+  the static path cannot read. The Playwright context reuses the
+  same UA + client-hint profile the static fetcher would have used
+  for the same domain, so the fingerprint is consistent.
+
+* `extractors/pipeline_extract.py` + `resolvers/` - 12 stateless
+  field resolvers feeding a `Listing` dataclass. Each resolver runs
+  independently; one failing resolver never breaks the others. JSON-LD
+  is consulted first, then DOM, then labelled text, then a final
+  regex sweep, with confidence scores that decrease at each step.
+
+* `storage.py` - streaming, append-only CSV writers with three-tier
+  per-domain dedup: `(domain, reference_id)`, then
+  `(domain, canonical_url)`, then a content fingerprint over the
+  resolved descriptor fields, so reference-less and
+  query-string-collapsed listings still dedupe.
+
+* `checkpoint.py` - JSON resume checkpoint so a crashed run resumes
+  from the next unprocessed domain instead of restarting.
+
+* `utils/geocoder.py` - opt-in async geocoder backed by Nominatim,
+  with a JSON-on-disk cache that survives across runs.
+
+## Quick start
+
+From the `realestate_scraper/` directory:
 
 ```bash
-python -m scraper.pipeline_playwright
+pip install -r requirements.txt
+python -m playwright install chromium  # only if ENABLE_PLAYWRIGHT=true
+cp .env.example .env                   # adjust as needed
+python -m scraper
 ```
 
-## 📊 Outputs 
+Output appears in `output/` (created automatically).
 
-Check the system generated `output/` directory for your data:
-- `listings_consolidated.csv`: The clean, flat rows containing all extracted `reference_id, price, location, types, rooms, etc`.
-- `error_log.csv`: The diagnostics record denoting why an individual network block failed to yield property listings. 
+### CLI flags
+
+| Flag                   | Meaning                                                    |
+|------------------------|------------------------------------------------------------|
+| `--limit N`            | Process at most `N` domains this run.                      |
+| `--keep-outputs`       | Append to existing CSVs instead of truncating.             |
+| `--reset-checkpoint`   | Wipe the resume checkpoint before starting.                |
+| `--log-level LEVEL`    | Override `LOG_LEVEL` (`DEBUG`, `INFO`, `WARNING`, ...).    |
+
+### Configuration
+
+Every operational knob is in `scraper/config.py` and exposed via
+environment variables / `.env`. See `.env.example` for the full list.
+There are no hardcoded paths anywhere in the code; the project root
+is derived from the package location.
+
+## How the brief's six error reasons are produced
+
+* `no_website` - the input row has no `website` column value (raised
+  by `domain_loader.py` before the pipeline runs).
+* `site_not_reachable` - the reachability probe found no answering
+  variant within the timeout, or the domain timed out against the
+  per-domain budget.
+* `blocked_403` - the probe or fetcher returned 401/403/429 and the
+  UA-rotation retry also failed.
+* `dynamic_js_required` - the static path returned no usable HTML and
+  the dynamic path is disabled (`ENABLE_PLAYWRIGHT=false`) or also
+  failed to render content.
+* `parsing_failed` - extraction crashed in a way that does not match
+  any of the network markers.
+* `no_listings_found` - everything ran to completion but produced no
+  publishable listings.
+
+The vocabulary is defined in `scraper/error_codes.py` and is the
+single point of truth - any new failure path must map back to one of
+these six codes.
+
+## Testing
+
+```bash
+pytest -q
+```
+
+Unit tests cover every resolver, the URL classifier, the fingerprint
+probe, the storage dedup, the domain loader, and the end-to-end
+resolver pipeline. Tests use no network access.
