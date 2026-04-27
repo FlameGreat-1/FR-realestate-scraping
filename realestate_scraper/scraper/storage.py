@@ -1,86 +1,227 @@
+"""Streaming, dedup-aware CSV writers for listings, errors, and summaries.
+
+Design notes:
+    * Append-only writers with header initialisation; safe to call from
+      many coroutines through an internal `asyncio.Lock`.
+    * In-memory dedup keyed on `(source_domain, reference_id)` falling
+      back to `(source_domain, canonical_url)`. No post-hoc rewrite of
+      the whole file - critical when scaling to 55k+ domains.
+    * Headers and column order are sourced from `models.py` so the brief
+      contract has a single point of truth.
+"""
+from __future__ import annotations
+
+import asyncio
 import csv
+import logging
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Iterable, Optional
 
-OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+from .error_codes import ErrorReason
+from .models import (
+    DOMAIN_SUMMARY_FIELDS,
+    DomainResult,
+    ERROR_FIELDS,
+    ErrorRecord,
+    LISTING_FIELDS,
+    Listing,
+)
+from .utils.url import dedup_key
 
-LISTINGS_CSV = OUTPUT_DIR / "listings_consolidated.csv"
-ERROR_LOG_CSV = OUTPUT_DIR / "error_log.csv"
+log = logging.getLogger(__name__)
 
-LISTINGS_HEADERS = [
-    "reference_id", "domain", "price", "property_type", "location", 
-    "surface_area", "rooms", "bedrooms", "agency_name", 
-    "agent_name", "phone", "email", "coordinates", "dpe_rating", "url"
-]
 
-ERROR_HEADERS = [
-    "domain", "status", "reason"
-]
-
-def init_storage():
-    # Always write headers (run_production clears the files before calling this)
-    with LISTINGS_CSV.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=LISTINGS_HEADERS)
-        writer.writeheader()
-    
-    with ERROR_LOG_CSV.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=ERROR_HEADERS)
-        writer.writeheader()
-
-def write_listings(listings: List[Dict[str, Any]]) -> None:
-    if not listings:
+def _ensure_header(path: Path, header: tuple[str, ...]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size > 0:
         return
-    with LISTINGS_CSV.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=LISTINGS_HEADERS, extrasaction='ignore')
-        for row in listings:
-            writer.writerow(row)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow(header)
 
-def write_error(domain: str, status: str, reason: str = "") -> None:
-    with ERROR_LOG_CSV.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=ERROR_HEADERS)
-        writer.writerow({
-            "domain": domain,
-            "status": status,
-            "reason": reason
-        })
 
-def deduplicate_final_csv():
-    if not LISTINGS_CSV.exists():
-        return
-    
-    with LISTINGS_CSV.open(newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+def _truncate(path: Path, header: tuple[str, ...]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow(header)
 
-    if not rows:
-        return
 
-    initial_count = len(rows)
-    seen_ref = set()
-    seen_url = set()
-    deduped = []
+class ListingWriter:
+    """Append-only listing writer with cross-domain deduplication."""
 
-    for row in rows:
-        domain = row.get("domain", "")
-        reference_id = row.get("reference_id", "").strip()
-        url = row.get("url", "").strip()
+    def __init__(self, csv_path: Path) -> None:
+        self._path = csv_path
+        self._lock = asyncio.Lock()
+        self._seen_ref: set[tuple[str, str]] = set()
+        self._seen_url: set[tuple[str, str]] = set()
+        self._written = 0
 
-        if reference_id:
-            ref_key = (domain, reference_id)
-            if ref_key in seen_ref:
+    @property
+    def written(self) -> int:
+        return self._written
+
+    async def initialize(self, *, truncate: bool) -> None:
+        async with self._lock:
+            if truncate:
+                _truncate(self._path, LISTING_FIELDS)
+            else:
+                _ensure_header(self._path, LISTING_FIELDS)
+
+    async def write_many(self, listings: Iterable[Listing]) -> int:
+        accepted: list[Listing] = []
+        for listing in listings:
+            if not isinstance(listing, Listing):
                 continue
-            seen_ref.add(ref_key)
-        elif url:
-            url_key = (domain, url)
-            if url_key in seen_url:
+            if not listing.is_publishable():
                 continue
-            seen_url.add(url_key)
+            if not self._register(listing):
+                continue
+            accepted.append(listing)
+        if not accepted:
+            return 0
 
-        deduped.append(row)
+        async with self._lock:
+            with self._path.open("a", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=LISTING_FIELDS,
+                    extrasaction="raise",
+                    quoting=csv.QUOTE_MINIMAL,
+                )
+                for listing in accepted:
+                    writer.writerow(listing.to_row())
+            self._written += len(accepted)
+        return len(accepted)
 
-    final_count = len(deduped)
-    with LISTINGS_CSV.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=LISTINGS_HEADERS)
-        writer.writeheader()
-        writer.writerows(deduped)
-    print(f"Global Deduplication: Reduced {initial_count} -> {final_count} listings.")
+    def _register(self, listing: Listing) -> bool:
+        domain = (listing.source_domain or "").strip().lower()
+        ref = (listing.reference_id or "").strip()
+        url_key = dedup_key(listing.source_url)
+
+        if domain and ref:
+            key = (domain, ref.lower())
+            if key in self._seen_ref:
+                return False
+            self._seen_ref.add(key)
+            if domain and url_key:
+                self._seen_url.add((domain, url_key))
+            return True
+
+        if domain and url_key:
+            key = (domain, url_key)
+            if key in self._seen_url:
+                return False
+            self._seen_url.add(key)
+            return True
+
+        return True
+
+
+class ErrorLogWriter:
+    """Append-only writer for the brief-mandated error log."""
+
+    def __init__(self, csv_path: Path) -> None:
+        self._path = csv_path
+        self._lock = asyncio.Lock()
+        self._written: dict[str, str] = {}
+
+    async def initialize(self, *, truncate: bool) -> None:
+        async with self._lock:
+            if truncate:
+                _truncate(self._path, ERROR_FIELDS)
+            else:
+                _ensure_header(self._path, ERROR_FIELDS)
+
+    async def record(
+        self,
+        domain: str,
+        reason: ErrorReason,
+        *,
+        status: str = "failed",
+    ) -> None:
+        domain = (domain or "").strip().lower()
+        if not domain:
+            return
+        record = ErrorRecord(domain=domain, status=status, reason=reason)
+        async with self._lock:
+            # Idempotent per domain - keep the first authoritative reason.
+            if self._written.get(domain) == reason.value:
+                return
+            self._written[domain] = reason.value
+            with self._path.open("a", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=ERROR_FIELDS,
+                    extrasaction="raise",
+                    quoting=csv.QUOTE_MINIMAL,
+                )
+                writer.writerow(record.to_row())
+
+
+class DomainSummaryWriter:
+    """Append-only writer for the per-domain status summary CSV."""
+
+    def __init__(self, csv_path: Path) -> None:
+        self._path = csv_path
+        self._lock = asyncio.Lock()
+
+    async def initialize(self, *, truncate: bool) -> None:
+        async with self._lock:
+            if truncate:
+                _truncate(self._path, DOMAIN_SUMMARY_FIELDS)
+            else:
+                _ensure_header(self._path, DOMAIN_SUMMARY_FIELDS)
+
+    async def record(self, result: DomainResult) -> None:
+        async with self._lock:
+            with self._path.open("a", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=DOMAIN_SUMMARY_FIELDS,
+                    extrasaction="raise",
+                    quoting=csv.QUOTE_MINIMAL,
+                )
+                writer.writerow(result.to_row())
+
+
+class OutputBundle:
+    """Convenience holder so the pipeline only depends on one object."""
+
+    def __init__(
+        self,
+        listings: ListingWriter,
+        errors: ErrorLogWriter,
+        summary: DomainSummaryWriter,
+    ) -> None:
+        self.listings = listings
+        self.errors = errors
+        self.summary = summary
+
+    async def initialize(self, *, truncate: bool) -> None:
+        await asyncio.gather(
+            self.listings.initialize(truncate=truncate),
+            self.errors.initialize(truncate=truncate),
+            self.summary.initialize(truncate=truncate),
+        )
+
+
+def build_output_bundle(
+    *,
+    listings_path: Path,
+    errors_path: Path,
+    summary_path: Path,
+) -> OutputBundle:
+    return OutputBundle(
+        listings=ListingWriter(listings_path),
+        errors=ErrorLogWriter(errors_path),
+        summary=DomainSummaryWriter(summary_path),
+    )
+
+
+def cleanup_legacy_outputs(*paths: Optional[Path]) -> None:
+    """Best-effort removal of stale output artifacts before a fresh run."""
+    for path in paths:
+        if path and path.exists():
+            try:
+                path.unlink()
+            except OSError as exc:
+                log.debug("could not remove %s: %s", path, exc)
