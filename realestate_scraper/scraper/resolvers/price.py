@@ -21,11 +21,19 @@ from selectolax.parser import HTMLParser
 from ..models import PageContext, ResolverResult
 from ..utils.text import clean_price, find_euro_amounts, find_priced_labels
 
+# Match per-m2 *rate* contexts only; a bare "120 m2" must NOT trip this.
+# Required: explicit currency-per-area or explicit "prix au m2" wording.
 _M2_NOISE = re.compile(
-    r"(prix\s*-?\s*m2|prix-rues|par\s*m2|€\s*/\s*m[²2²]|m\s*[²2²])",
+    r"(?:€|eur|euro[s]?)\s*(?:/|par)\s*m\s*[²2²]"
+    r"|prix\s*(?:au|/|-)\s*m\s*[²2²]"
+    r"|prix-rues"
+    r"|cost\s*per\s*m\s*[²2²]",
     re.IGNORECASE,
 )
-_ON_REQUEST = re.compile(r"sur\s+demande|on\s+request|prix\s+sur", re.IGNORECASE)
+_ON_REQUEST = re.compile(
+    r"sur\s+demande|on\s+request|prix\s+sur\s+demande|nous\s+consulter",
+    re.IGNORECASE,
+)
 
 _DOM_SELECTORS = (
     "[itemprop='price']",
