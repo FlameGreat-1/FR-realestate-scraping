@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     error_log_csv_name: str = Field(default="error_log.csv")
     domain_summary_csv_name: str = Field(default="domain_status_summary.csv")
     checkpoint_file_name: str = Field(default=".checkpoint.json")
+    geocode_cache_name: str = Field(default=".geocode_cache.json")
 
     # --- Concurrency ---
     domain_concurrency: int = Field(default=12, ge=1, le=256)
@@ -109,6 +110,10 @@ class Settings(BaseSettings):
     @property
     def checkpoint_path(self) -> Path:
         return self.output_dir_path / self.checkpoint_file_name
+
+    @property
+    def geocode_cache_path(self) -> Path:
+        return self.output_dir_path / self.geocode_cache_name
 
     @property
     def default_headers(self) -> dict[str, str]:

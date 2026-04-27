@@ -56,6 +56,7 @@ class Pipeline:
             enabled=settings.enable_geocoding,
             user_agent=settings.geocoder_user_agent,
             timeout=settings.geocoder_timeout,
+            cache_path=settings.geocode_cache_path,
         )
 
     async def run(self, jobs: list[DomainJob]) -> None:
