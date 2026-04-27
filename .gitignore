@@ -1,2 +1,38 @@
+# Project inputs that contain client data
 /FR_realestate_scraping - FR 140 (1).csv
 /RSA.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime artefacts
+/realestate_scraper/output/.checkpoint.json
+/realestate_scraper/output/*.tmp
