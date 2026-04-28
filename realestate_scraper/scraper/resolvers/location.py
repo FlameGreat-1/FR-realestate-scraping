@@ -32,6 +32,28 @@ _URL_LOCATION = re.compile(
     r"|(?:^|[/\-])(\d{5})-([a-z][a-z0-9\-]{2,})(?:[/,?\-]|$)",
     re.IGNORECASE,
 )
+# Page-title / h1 patterns. We capture the rightmost commune token
+# anchored on any of:
+#   `à <Commune>` / `a <Commune>` / `au <Commune>` / `at <Commune>`
+#   `<Commune> (<postal>)`
+#   `<Commune> <postal>`
+#   `<text>, <Commune>` (only when the comma-tail looks place-shaped)
+_TITLE_AT_COMMUNE = re.compile(
+    r"(?:[\s»])(?:à|a|au|aux|at)\s+"
+    r"([A-ZÀ-Ý][\wÀ-ÿ' \-]{2,40}?)"
+    r"(?=\s*(?:\(\d{5}\)|\b\d{5}\b|[,\-–—»]|$))",
+)
+_TITLE_COMMUNE_POSTAL = re.compile(
+    r"\b([A-ZÀ-Ý][\wÀ-ÿ' \-]{2,40}?)\s*\(?(\d{5})\)?\b",
+)
+# Body postal scan: a 5-digit postal code immediately preceded by a
+# capitalised word (or hyphenated capitalised compound). Tight enough
+# to not match unrelated numeric runs and city-less postal lists.
+_BODY_COMMUNE_POSTAL = re.compile(
+    r"\b([A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}"
+    r"(?:[\- ][A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}){0,3})"
+    r"\s+(\d{5})\b",
+)
 _BREADCRUMB_SELECTOR = (
     ".breadcrumb, .breadcrumbs, nav.breadcrumb, ol.breadcrumb, ul.breadcrumb, "
     "[itemtype*='BreadcrumbList'], [class*='breadcrumb' i], [class*='chemin' i]"
@@ -256,6 +278,79 @@ def _from_url_postal(url: str) -> str:
     return f"{last.capitalize()} {postal}"
 
 
+def _accept_commune_candidate(value: str) -> str:
+    """Trim and validate a commune-shaped candidate via `_looks_place_like`.
+
+    Returns the cleaned candidate when it passes the shape gate, or
+    empty string otherwise. Centralised so every new tier (title, h1,
+    body postal) shares the same acceptance criteria.
+    """
+    if not value:
+        return ""
+    cleaned = collapse_whitespace(value).strip(" -–—,»")
+    if not cleaned:
+        return ""
+    if not _looks_place_like(cleaned):
+        return ""
+    return cleaned
+
+
+def _from_title_or_h1(*texts: str) -> str:
+    """Scan page title / h1 strings for the rightmost commune candidate.
+
+    Two complementary patterns are evaluated, in this order:
+      * `à <Commune>` (`a/au/at`): the strongest French shape because
+        the preposition is unambiguous on listing titles.
+      * `<Commune> (<postal>)` / `<Commune> <postal>`: catches titles
+        that ship the postal code inline.
+    The first candidate that passes the shape gate wins. Each scan is
+    bounded by the input length (titles never exceed a few hundred
+    chars), so backtracking is not a risk.
+    """
+    for raw in texts:
+        if not raw:
+            continue
+        text = collapse_whitespace(raw)
+        if not text:
+            continue
+        # `à <Commune>` form: pad with leading space so the lookbehind
+        # at start-of-string is preserved without a separate pattern.
+        padded = " " + text
+        match = _TITLE_AT_COMMUNE.search(padded)
+        if match:
+            cleaned = _accept_commune_candidate(match.group(1))
+            if cleaned:
+                return cleaned
+        match = _TITLE_COMMUNE_POSTAL.search(text)
+        if match:
+            commune = match.group(1)
+            postal = match.group(2)
+            cleaned = _accept_commune_candidate(commune)
+            if cleaned:
+                return f"{cleaned} {postal}"
+    return ""
+
+
+def _from_body_postal(text: str) -> str:
+    """Pull the first `<Commune> <postal>` co-occurrence from body text.
+
+    The pattern is anchored on the postal code (always exactly five
+    digits in France), so unrelated numeric runs cannot match. The
+    leading capitalised word(s) are validated through the shape gate.
+    """
+    if not text:
+        return ""
+    match = _BODY_COMMUNE_POSTAL.search(text)
+    if not match:
+        return ""
+    commune = match.group(1)
+    postal = match.group(2)
+    cleaned = _accept_commune_candidate(commune)
+    if not cleaned:
+        return ""
+    return f"{cleaned} {postal}"
+
+
 def _slug_token_is_descriptor(token: str) -> bool:
     """True if a single URL-decoded slug token is a property descriptor.
 
@@ -397,7 +492,14 @@ class LocationResolver:
 
         url_postal = _from_url_postal(ctx.url or "")
         if url_postal:
-            return ResolverResult(url_postal, 0.7, "url_postal")
+            return ResolverResult(url_postal, 0.75, "url_postal")
+
+        # Title / H1: visible page header is the strongest in-page
+        # signal after JSON-LD on franchise/CMS templates that do not
+        # ship a postal code in their detail URLs.
+        title_value = _from_title_or_h1(ctx.title, ctx.h1)
+        if title_value:
+            return ResolverResult(title_value, 0.72, "title_h1")
 
         parser: Optional[HTMLParser] = None
         if ctx.html:
@@ -408,20 +510,28 @@ class LocationResolver:
             if parser is not None:
                 value = _from_breadcrumb(parser)
                 if value:
-                    return ResolverResult(value, 0.65, "breadcrumb")
+                    return ResolverResult(value, 0.7, "breadcrumb")
 
         url_slug = _from_url_slug(ctx.url or "")
         if url_slug:
             return ResolverResult(url_slug, 0.6, "url_slug")
+
+        # Body-text postal scan: catches detail pages whose template
+        # renders the address in a `.contact` / `.localisation` block
+        # without breadcrumb or title evidence.
+        body_value = _from_body_postal(ctx.text or "")
+        if body_value:
+            return ResolverResult(body_value, 0.58, "body_postal")
 
         if parser is not None:
             value = _from_meta(parser)
             if value:
                 return ResolverResult(value, 0.55, "meta")
 
-        # Agency-csv fallback: only if the page genuinely looks like a
-        # detail page. Otherwise we leave location empty rather than
-        # contaminating hub/contact/template pages.
+        # Agency-CSV fallback: last resort. Only fires when every
+        # in-page tier above returned empty. The `_is_listing_page`
+        # gate is preserved so hub / contact pages still never adopt
+        # the CSV locality.
         if ctx.domain_job and _is_listing_page(ctx, parser):
             fallback = collapse_whitespace(
                 f"{ctx.domain_job.city} {ctx.domain_job.postalcode}"

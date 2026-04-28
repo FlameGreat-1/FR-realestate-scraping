@@ -22,7 +22,47 @@ def test_location_from_breadcrumb():
     assert RESOLVER.resolve(ctx).value == "Lyon 69001"
 
 
-def test_location_falls_back_to_agency_csv():
+def test_location_from_title_overrides_agency_csv():
+    """A page title carrying `à <Commune>` must beat the agency CSV.
+
+    Reproduces the Nestenn regression: the input CSV row says the
+    Nestenn agency is in Saint-Lys 31470, but the actual property
+    page is for an apartment in Nice. The resolver must return Nice.
+    """
+    job = DomainJob(
+        domain="nestenn.com", url="https://nestenn.com",
+        city="Saint-Lys", postalcode="31470",
+    )
+    html = (
+        "<html><head><title>Appartement 3 pièces à vendre à Nice - Nestenn</title>"
+        "</head><body><h1>Appartement à Nice</h1></body></html>"
+    )
+    ctx = parse_page(
+        "https://immobilier-nice-port.nestenn.com/appartement-ref-39416895",
+        html,
+        domain_job=job,
+    )
+    assert RESOLVER.resolve(ctx).value == "Nice"
+
+
+def test_location_from_body_postal_overrides_agency_csv():
+    """`<Commune> <postal>` co-occurrence in body text wins over the CSV."""
+    job = DomainJob(
+        domain="x.com", url="https://x.com",
+        city="Bordeaux", postalcode="33000",
+    )
+    html = (
+        "<html><body>Maison à vendre dans le Bassin d'Arcachon, "
+        "située à Lege Cap Ferret 33950, vue panoramique."
+        "</body></html>"
+    )
+    ctx = parse_page(
+        "https://x.com/biens/86083117", html, domain_job=job,
+    )
+    assert RESOLVER.resolve(ctx).value == "Lege Cap Ferret 33950"
+
+
+def test_location_falls_back_to_agency_csv_when_page_has_nothing():
     job = DomainJob(
         domain="x.com", url="https://x.com", city="Toulouse", postalcode="31000"
     )
