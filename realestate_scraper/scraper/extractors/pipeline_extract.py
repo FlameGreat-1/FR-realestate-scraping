@@ -3,9 +3,11 @@
 The orchestrator owns the resolver instances (stateless, so a single
 instance per process is fine) and applies them in the order required to
 fill a `Listing`. Each resolver runs independently; a failure to resolve
-one field never prevents the others.
+one field never prevents the others (see `_safe_resolve`).
 """
 from __future__ import annotations
+
+import logging
 
 from selectolax.parser import HTMLParser
 
@@ -25,6 +27,8 @@ from ..resolvers.surface import SurfaceResolver
 from ..utils.json_ld import extract_json_ld
 from ..utils.text import collapse_whitespace
 from ..utils.url import canonicalize, parse_registrable_domain
+
+log = logging.getLogger(__name__)
 
 
 _PRICE = PriceResolver()
