@@ -35,7 +35,10 @@ def parse_registrable_domain(url: str) -> str:
         return ""
     extracted = _EXTRACT(url)
     if not extracted.domain or not extracted.suffix:
-        return urlparse(ensure_scheme(url)).netloc.lower().lstrip("www.")
+        # `lstrip("www.")` would strip any leading w / . character; use
+        # the literal-prefix `removeprefix` instead so hosts like
+        # `wxyz.example.com` are not corrupted.
+        return urlparse(ensure_scheme(url)).netloc.lower().removeprefix("www.")
     return f"{extracted.domain}.{extracted.suffix}".lower()
 
 
@@ -44,7 +47,7 @@ def parse_host(url: str) -> str:
     if not url:
         return ""
     netloc = urlparse(ensure_scheme(url)).netloc.lower()
-    return netloc[4:] if netloc.startswith("www.") else netloc
+    return netloc.removeprefix("www.")
 
 
 def same_registrable_domain(a: str, b: str) -> bool:
