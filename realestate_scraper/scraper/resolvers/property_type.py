@@ -1,30 +1,78 @@
 """Property-type resolver.
 
 Property types are highly stable French/English vocabulary. We scan the
-title, H1, and JSON-LD `name`/`description` for a hit. The url is used
-as a tertiary tie-breaker.
+title, H1, and JSON-LD `name`/`description` for a hit, and fall back
+to the URL slug.
+
+Matching rules:
+    * The token table is ordered (display_value, synonyms_in_match_order)
+      and scanned longest-synonym-first so multi-word categories
+      ("local commercial") win over their substring ("local"), and
+      plurals win over singulars ("bureaux" before "bureau").
+    * Output is the canonical singular form, regardless of which
+      synonym matched, so the property_type column is a stable
+      category rather than whatever inflection the page happened to
+      use.
 """
 from __future__ import annotations
+
+from typing import Iterable
 
 from ..models import PageContext, ResolverResult
 from ..utils.text import normalize_for_match
 
-_PROPERTY_TYPES = (
-    "maison", "appartement", "villa", "terrain", "garage",
-    "studio", "chalet", "moulin", "duplex", "loft",
-    "chateau", "parking", "immeuble", "local commercial",
-    "local", "bureau", "bureaux", "hotel", "ferme",
+
+# (canonical_singular, synonyms). Synonyms include plurals and common
+# multi-word forms. Order inside `_PROPERTY_TYPES` does not matter; the
+# scanner sorts all synonyms by length descending so the most specific
+# match always wins.
+_PROPERTY_TYPES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("local commercial", ("local commercial", "locaux commerciaux")),
+    ("appartement", ("appartements", "appartement")),
+    ("maison", ("maisons", "maison")),
+    ("villa", ("villas", "villa")),
+    ("terrain", ("terrains", "terrain")),
+    ("studio", ("studios", "studio")),
+    ("chalet", ("chalets", "chalet")),
+    ("chateau", ("chateaux", "chateau")),
+    ("duplex", ("duplex",)),
+    ("loft", ("lofts", "loft")),
+    ("moulin", ("moulins", "moulin")),
+    ("immeuble", ("immeubles", "immeuble")),
+    ("parking", ("parkings", "parking")),
+    ("garage", ("garages", "garage")),
+    ("bureau", ("bureaux", "bureau")),
+    ("hotel", ("hotels", "hotel")),
+    ("ferme", ("fermes", "ferme")),
+    ("local", ("locaux", "local")),
 )
 
 
-def _scan(text: str) -> str:
+def _flattened_terms() -> tuple[tuple[str, str], ...]:
+    """Return every (synonym, canonical) pair, sorted longest-first."""
+    pairs: list[tuple[str, str]] = []
+    for canonical, synonyms in _PROPERTY_TYPES:
+        for synonym in synonyms:
+            normalised = normalize_for_match(synonym)
+            if normalised:
+                pairs.append((normalised, canonical))
+    # Stable sort: longest first, then alphabetical for determinism.
+    pairs.sort(key=lambda item: (-len(item[0]), item[0]))
+    return tuple(pairs)
+
+
+_TERMS: tuple[tuple[str, str], ...] = _flattened_terms()
+
+
+def _scan(text: str, terms: Iterable[tuple[str, str]] = _TERMS) -> str:
     if not text:
         return ""
     normalised = normalize_for_match(text)
-    for value in _PROPERTY_TYPES:
-        target = normalize_for_match(value)
-        if target and target in normalised:
-            return value
+    if not normalised:
+        return ""
+    for synonym, canonical in terms:
+        if synonym in normalised:
+            return canonical
     return ""
 
 
