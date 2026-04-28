@@ -16,7 +16,9 @@ ORPI = Family(
         r"/annonce[s]?-(?:vente|location)/",
         r"/biens-(?:vente|location)/",
     ),
-    requires_dynamic=True,
+    # Detail pages serve usable static HTML. Pipeline escalates to
+    # dynamic on zero-listing static, so coverage is preserved.
+    requires_dynamic=False,
 )
 
 get_registry().register(ORPI)

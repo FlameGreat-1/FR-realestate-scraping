@@ -16,7 +16,9 @@ STEPHANE_PLAZA = Family(
         r"/biens?/(?:vente|location)/[^/]+/[^/]+",
         r"/annonce[s]?/",
     ),
-    requires_dynamic=True,
+    # Detail pages serve usable static HTML. Pipeline escalates to
+    # dynamic on zero-listing static, so coverage is preserved.
+    requires_dynamic=False,
     selectors={
         "price": (".bien-prix", ".price", "[itemprop='price']"),
     },
