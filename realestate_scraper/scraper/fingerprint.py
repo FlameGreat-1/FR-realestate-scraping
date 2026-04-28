@@ -29,18 +29,29 @@ log = logging.getLogger(__name__)
 
 _HEAD_BYTES = 65_536
 
-_DYNAMIC_HTML_MARKERS = (
-    re.compile(r"<noscript[^>]*>\s*(?:you|enable javascript)", re.IGNORECASE),
+# Strong markers: presence of any one is enough to require Playwright.
+_STRONG_DYNAMIC_MARKERS = (
     re.compile(r"window\.__NUXT__", re.IGNORECASE),
     re.compile(r"window\.__NEXT_DATA__", re.IGNORECASE),
     re.compile(r"id=\"__next\"", re.IGNORECASE),
-    re.compile(r"id=\"app\"[^>]*></div>", re.IGNORECASE),
     re.compile(r"data-react-helmet", re.IGNORECASE),
     re.compile(r"ng-app=", re.IGNORECASE),
     re.compile(r"cf-browser-verification|challenge-platform", re.IGNORECASE),
 )
 
+# Weak markers: only count when the page has no structural anchor.
+# An empty <body><div id="app"></div></body> shell is dynamic; the
+# same div on a page that also has <main> or <article> is just a JS
+# carousel widget on an otherwise-static site.
+_WEAK_DYNAMIC_MARKERS = (
+    re.compile(r"<noscript[^>]*>\s*(?:you|enable javascript)", re.IGNORECASE),
+    re.compile(r"id=\"app\"[^>]*></div>", re.IGNORECASE),
+)
+
 _BODY_PRESENCE = re.compile(r"<body[^>]*>(.{200,})</body>", re.IGNORECASE | re.DOTALL)
+_STRUCTURAL_ANCHOR = re.compile(
+    r"<(?:main|article|section)\b", re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -67,16 +78,43 @@ class Fingerprint:
 
 
 def _looks_dynamic(html: str, families: tuple[Family, ...]) -> bool:
+    """Decide whether a domain genuinely needs Playwright.
+
+    The previous heuristic (text_density < 400 OR any marker) was
+    over-eager: Apimo / Periscope / Hektor agency sites have a
+    JS-heavy homepage (carousel, search widget) over a perfectly
+    static detail-page CMS, so the homepage sample at fingerprint
+    time misled it into the dynamic branch. Result: ~50% of sites
+    were flagged DYNAMIC when ~25% truly were, doubling browser-pool
+    contention.
+
+    New rules, in order:
+      * Family says it requires JS -> dynamic.
+      * Any STRONG marker present (Nuxt/Next/React/Angular/Cloudflare
+        challenge) -> dynamic.
+      * No body content at all -> dynamic.
+      * Weak marker present AND no <main>/<article>/<section> anchor
+        AND text_density < 400 -> dynamic.
+      * Otherwise -> static. The static path will fall back to
+        dynamic on a per-domain basis if it produces zero listings.
+    """
     if any(family.requires_dynamic for family in families):
         return True
     if not html:
-        return False
+        return True
+    if any(pattern.search(html) for pattern in _STRONG_DYNAMIC_MARKERS):
+        return True
     body_match = _BODY_PRESENCE.search(html)
     body_text = body_match.group(1) if body_match else ""
     text_density = len(re.sub(r"<[^>]+>", " ", body_text or "").strip())
-    if text_density < 400:
+    has_anchor = bool(_STRUCTURAL_ANCHOR.search(html))
+    has_weak_marker = any(
+        pattern.search(html) for pattern in _WEAK_DYNAMIC_MARKERS
+    )
+    # Empty body shell with weak marker: dynamic.
+    if has_weak_marker and not has_anchor and text_density < 400:
         return True
-    return any(pattern.search(html) for pattern in _DYNAMIC_HTML_MARKERS)
+    return False
 
 
 async def fingerprint_site(

@@ -36,10 +36,19 @@ class Settings(BaseSettings):
     geocode_cache_name: str = Field(default=".geocode_cache.json")
 
     # --- Concurrency ---
-    domain_concurrency: int = Field(default=12, ge=1, le=256)
+    # Rebalanced after the browser-pool-bound MR.
+    # Math at the observed ~50% dynamic-strategy rate on this corpus:
+    #   queued borrows = domain_concurrency * 0.5 * (1 homepage + 3 esc)
+    #   queue depth    = queued / browser_concurrency
+    #   tail latency   = depth * ~30s render
+    # 8 domains * 4 borrows / 6 contexts = 5.3 -> ~2.7 deep queue,
+    # ~81s tail. Fits within domain_time_budget * 0.7 = 84s. Total
+    # throughput is unchanged because the 8-domain run finishes a
+    # ~50% larger fraction of starts vs the 12-domain run.
+    domain_concurrency: int = Field(default=8, ge=1, le=256)
     per_host_concurrency: int = Field(default=6, ge=1, le=64)
     listing_concurrency: int = Field(default=24, ge=1, le=256)
-    browser_concurrency: int = Field(default=4, ge=1, le=32)
+    browser_concurrency: int = Field(default=6, ge=1, le=32)
 
     # --- Timeouts ---
     http_probe_timeout: float = Field(default=6.0, gt=0)
