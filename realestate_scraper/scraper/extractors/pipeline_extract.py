@@ -149,3 +149,38 @@ def build_listing(ctx: PageContext) -> Listing:
     listing.agent_name = _safe_resolve(_AGENT, ctx)
 
     return listing
+
+
+def parse_and_build_listing(
+    url: str,
+    html: str,
+    domain_job: DomainJob | None = None,
+) -> Listing | None:
+    """Synchronous combined entry point for parse + build_listing.
+
+    Returns the Listing when publishable, None otherwise. Designed to
+    be invoked through `asyncio.to_thread` so the synchronous
+    selectolax / regex / resolver work runs OFF the event loop.
+    Running this work on the loop directly is the architectural
+    defect that froze the pipeline up through Round 8 - the
+    selectolax C extension and regex engine do not yield to asyncio,
+    so per-listing wall-clock guards (asyncio.wait_for) cannot
+    interrupt them.
+
+    Why a combined helper rather than two `to_thread` calls:
+        * Each `to_thread` round-trip costs an executor handoff. One
+          handoff per listing is cheap; two doubles it.
+        * Crashes inside `parse_page` (e.g. selectolax raising on
+          malformed HTML) are now contained the same way resolver
+          crashes are: a try/except returns None and the caller
+          drops the listing without aborting the gather.
+    """
+    try:
+        ctx = parse_page(url, html, domain_job=domain_job)
+        listing = build_listing(ctx)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("parse_and_build_listing failed for %s: %s", url, exc)
+        return None
+    if not listing.is_publishable():
+        return None
+    return listing

@@ -24,7 +24,7 @@ from ..http_client import HttpFetcher
 from ..models import DomainJob, Listing
 from ..utils.url import dedup_key
 from .discovery import CandidateDiscovery
-from .pipeline_extract import build_listing, parse_page
+from .pipeline_extract import parse_and_build_listing
 
 log = logging.getLogger(__name__)
 
@@ -66,15 +66,19 @@ class StaticExtractor:
                 outcome = await self._fetcher.fetch(url)
             if not outcome.ok or not outcome.is_html_like or not outcome.text:
                 return None
-            ctx = parse_page(
+            # CPU-bound parse + resolver work runs OFF the event loop.
+            # See DynamicExtractor._process for the full rationale; the
+            # short version is that selectolax and the regex engine do
+            # NOT yield to asyncio, and running them on the loop
+            # serialises every concurrent domain into a single
+            # CPU-bound queue. `asyncio.to_thread` keeps the loop
+            # responsive and lets per-listing wait_for fire correctly.
+            return await asyncio.to_thread(
+                parse_and_build_listing,
                 outcome.final_url or url,
                 outcome.text,
-                domain_job=job,
+                job,
             )
-            listing = build_listing(ctx)
-            if not listing.is_publishable():
-                return None
-            return listing
 
         async def _bounded_process(url: str) -> Listing | None:
             """Per-listing wall-clock guard.
