@@ -108,6 +108,9 @@ _BARE_HUB_TAILS: frozenset[str] = frozenset({
     "garage", "garages", "parking", "parkings",
     "local", "locaux", "bureau", "bureaux",
     "immeuble", "immeubles",
+    "chalet", "chalets", "chateau", "chateaux",
+    "duplex", "ferme", "fermes",
+    "hotel", "hotels", "moulin", "moulins",
 })
 
 # Reasons the detail classifier emits when it rejects a URL specifically
