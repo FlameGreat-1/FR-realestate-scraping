@@ -189,24 +189,40 @@ class CandidateDiscovery:
             return list(details.values())
 
         hubs_fetched = 0
+        # Fetch all hubs at the same BFS depth concurrently instead of
+        # sequentially. This reduces hub expansion from sum(fetch_times)
+        # to max(fetch_times) per depth level.
         while hub_queue and hubs_fetched < hub_budget:
-            hub_url, depth = hub_queue.popleft()
-            hubs_fetched += 1
-            outcome = await self._fetcher.fetch(hub_url)
-            if (
-                not outcome.ok
-                or not outcome.is_html_like
-                or not outcome.text
-            ):
-                continue
-            base = outcome.final_url or hub_url
-            for href in _extract_anchor_hrefs(outcome.text):
-                if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            # Drain the current depth level into a batch.
+            batch: list[tuple[str, int]] = []
+            while hub_queue and hubs_fetched + len(batch) < hub_budget:
+                batch.append(hub_queue.popleft())
+            if not batch:
+                break
+
+            outcomes = await asyncio.gather(
+                *(self._fetcher.fetch(hub_url) for hub_url, _ in batch),
+                return_exceptions=True,
+            )
+            hubs_fetched += len(batch)
+
+            for (hub_url, depth), outcome in zip(batch, outcomes):
+                if isinstance(outcome, BaseException):
                     continue
-                absolute = join_url(base, href)
-                if not absolute.startswith(("http://", "https://")):
+                if (
+                    not outcome.ok
+                    or not outcome.is_html_like
+                    or not outcome.text
+                ):
                     continue
-                _consider(absolute, depth=depth + 1)
+                base = outcome.final_url or hub_url
+                for href in _extract_anchor_hrefs(outcome.text):
+                    if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+                        continue
+                    absolute = join_url(base, href)
+                    if not absolute.startswith(("http://", "https://")):
+                        continue
+                    _consider(absolute, depth=depth + 1)
 
         if hubs_fetched:
             log.debug(
