@@ -182,6 +182,13 @@ class HttpFetcher:
         All variants are probed concurrently; the first successful
         response wins. This reduces worst-case probe time from
         N * timeout to max(timeout) for unreachable hosts.
+
+        When every variant returns None (no answer), a single plain
+        GET (no Range header) is attempted against the primary
+        variant. Some servers reject the Range header the fast-path
+        ships, returning 416 / closing the connection / silently
+        dropping the request - this fall-through rescues those hosts
+        without paying any cost on the healthy fast-path.
         """
         if not url:
             return ProbeResult(status_code=None, final_url=url)
@@ -205,6 +212,15 @@ class HttpFetcher:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Every Range probe returned None. Retry the primary variant
+        # once with a plain GET - some servers reject Range headers
+        # but accept normal requests. Bounded to one extra attempt;
+        # the per-domain budget still envelopes us.
+        primary = variants[0]
+        status = await self._probe_single_plain(primary)
+        if status is not None:
+            return ProbeResult(status_code=status, final_url=primary)
         return ProbeResult(status_code=None, final_url=url)
 
     async def _probe_single(self, url: str) -> Optional[int]:
@@ -229,6 +245,27 @@ class HttpFetcher:
                 return response.status_code
             except httpx.HTTPError as exc:
                 log.debug("probe GET %s failed: %s", url, exc)
+                return None
+
+    async def _probe_single_plain(self, url: str) -> Optional[int]:
+        """Send one plain GET probe (no Range header) for the fall-through.
+
+        Used only when every Range probe variant returned None. Reuses
+        the same per-host slot and header rotation, so we never
+        bypass the limiter or anti-block layer.
+        """
+        headers = dict(self.headers_for(url))
+        async with self._limiter.slot(url):
+            try:
+                response = await self._client.request(
+                    "GET",
+                    url,
+                    timeout=self._probe_timeout,
+                    headers=headers,
+                )
+                return response.status_code
+            except httpx.HTTPError as exc:
+                log.debug("plain probe GET %s failed: %s", url, exc)
                 return None
 
     async def fetch(
