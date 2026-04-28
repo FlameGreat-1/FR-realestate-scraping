@@ -36,7 +36,6 @@ from .extractors.static_extractor import StaticExtractor
 from .fingerprint import Fingerprint, fingerprint_site
 from .http_client import open_fetcher
 from .logging_setup import configure_logging
-from typing import Optional  # noqa: F401  # re-import-safe at module scope
 from .models import (
     DomainJob,
     DomainResult,
