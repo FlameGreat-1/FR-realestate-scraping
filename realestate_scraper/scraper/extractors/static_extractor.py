@@ -125,17 +125,19 @@ class StaticExtractor:
                 seen_keys.add(key)
                 results.append(listing)
         finally:
-            # Structured cancellation: when the domain-level wait_for
-            # fires or any exception propagates, every pending task
-            # MUST be cancelled. Without this, orphaned tasks hold
-            # browser pool slots, httpx connections, and thread pool
-            # workers indefinitely, causing cascading hangs across
-            # all subsequent domains.
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            # Give cancelled tasks one event-loop tick to process the
-            # CancelledError so their finally blocks (semaphore
-            # releases, page closes) actually execute.
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                log.debug(
+                    "static: cleanup gather timed out for %s, "
+                    "abandoning %d tasks",
+                    job.domain,
+                    sum(1 for t in tasks if not t.done()),
+                )
         return results
