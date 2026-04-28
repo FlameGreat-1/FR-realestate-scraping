@@ -5,14 +5,21 @@ Real estate sites use very different conventions, so we look in:
     2. Visible labels (`Réf.\u00a0XYZ123`, `Reference: XYZ123`).
     3. URL slug heuristics (final path segment, comma-suffix, `-vp123`).
 
-Guards (Round 2):
+Guards (Round 4):
     * Labels accept only identifier-shaped tokens.
-    * Junk tokens cover the full nav/category vocabulary.
+    * Junk tokens cover the full nav/category vocabulary, plus the
+      CTA / form vocabulary observed in the Round 3 outputs
+      (`estimez-votre-bien`, `mettre-en-location`, `evaluer-mon-bien`,
+      `vendre-mon-bien`, ...).
     * Slug fallback enforces a hyphen budget (<= 3) and a length
       ceiling (<= 30 chars). A real reference is short.
-    * Slug must contain at least one digit OR start with an upper-case
-      acronym; pure lower-case hyphenated phrases (blog / info pages)
-      are rejected.
+    * Comma-suffix slugs are validated on BOTH halves: the stem must
+      itself be identifier-shaped (so a UI verb is rejected), and the
+      tail must not be a bare 1-3 digit number (so the `,107` /
+      `,123` query-style tails do not slip through).
+    * The full slug must not be a pure-numeric short token; real
+      references with a leading numeric stem also carry a typed
+      prefix or a separator.
 """
 from __future__ import annotations
 
@@ -58,7 +65,29 @@ _JUNK_TOKENS = (
     "d-architecture", "hqe", "habitat-durable",
     "choisir", "realiser", "reception",
     "parrainage", "taxe", "vendre",
+    # Round 4 additions: CTA / form slugs surfaced by Round 3 audit.
+    "estimez-votre-bien", "estimez", "estimer-mon-bien",
+    "evaluer-mon-bien", "evaluation",
+    "mettre-en-location", "mettre-en-vente", "mettre-en",
+    "vendre-mon-bien", "vendre-son-bien",
+    "acheter-un-bien", "louer-un-bien",
+    "deposer-une-annonce", "poster-une-annonce",
+    "prendre-rendez-vous", "rendez-vous",
+    "demande-de-rappel", "rappelez-moi", "rappel-immediat",
+    "transaction",
 )
+
+# UI-verb roots: a slug whose first hyphen-token is one of these is a
+# call-to-action, not a listing detail page. Used for the no-comma path.
+_UI_VERB_ROOTS: frozenset[str] = frozenset({
+    "mettre", "estimez", "estimer", "evaluer", "evaluez",
+    "vendre", "vendez", "acheter", "achetez", "louer", "louez",
+    "contacter", "contactez", "demander", "demandez",
+    "deposer", "deposez", "poster", "prendre", "rappeler",
+    "rappelez", "calculer", "calculez", "simuler", "simulez",
+    "choisir", "choisissez", "trouver", "trouvez",
+    "reserver", "reservez", "signaler", "signalez",
+})
 
 _VP_VM = re.compile(r"\b([A-Z]{1,3}\d{3,})\b")
 
@@ -78,6 +107,14 @@ _MAX_SLUG_LENGTH = 30
 # Pre-compiled checks for slug acceptability.
 _HAS_DIGIT = re.compile(r"\d")
 _LEADING_ACRONYM = re.compile(r"^[A-Z]{2,}[\-_/0-9]")
+# A bare 1-3 digit token: too short to be a real reference id on the
+# CMSes observed (Apimo / Hektor / Periscope / custom WP all use >= 4
+# digits). Used to reject `,107`, `,123` and similar query-style tails.
+_BARE_SHORT_NUMERIC = re.compile(r"^\d{1,3}$")
+# Pure-digit tokens of any length without an internal separator are
+# never accepted as references on their own; the typed-prefix or the
+# explicit `Réf.` label paths cover legitimate numeric refs.
+_BARE_DIGITS = re.compile(r"^\d+$")
 
 
 def _is_junk(value: str) -> bool:
@@ -98,16 +135,35 @@ def _slug_passes_shape(slug: str) -> bool:
         - length <= _MAX_SLUG_LENGTH
         - at most _MAX_SLUG_HYPHENS hyphens
         - contains a digit OR begins with a 2+ char upper-case acronym
+        - is NOT a bare 1-3 digit number (those are query/page tails)
+        - is NOT a bare pure-digit string without any separator
+          (those are pagination indices on most CMSes)
     """
     if not slug or len(slug) > _MAX_SLUG_LENGTH:
         return False
     if slug.count("-") > _MAX_SLUG_HYPHENS:
+        return False
+    if _BARE_SHORT_NUMERIC.match(slug):
+        return False
+    if _BARE_DIGITS.match(slug):
         return False
     if _HAS_DIGIT.search(slug):
         return True
     if _LEADING_ACRONYM.match(slug):
         return True
     return False
+
+
+def _stem_is_ui_verb(stem: str) -> bool:
+    """True if a hyphenated stem starts with a UI-verb root.
+
+    Rejects `estimez-votre-bien`, `mettre-en-location`, `vendre-mon-bien`,
+    etc. - CTA pages on every CMS we observe.
+    """
+    if not stem:
+        return False
+    head = stem.split("-", 1)[0].lower()
+    return head in _UI_VERB_ROOTS
 
 
 def _from_slug(url: str) -> str:
@@ -117,8 +173,29 @@ def _from_slug(url: str) -> str:
     if not path:
         return ""
     last = path.split("/")[-1]
+
+    # Comma-suffix path: validate BOTH the stem and the tail.
     if "," in last:
-        last = last.split(",")[-1]
+        stem, _, tail = last.rpartition(",")
+        stem = stem.strip(".,;:")
+        tail = tail.strip(".,;:")
+        if not tail or len(tail) < 3:
+            return ""
+        if _is_junk(stem) or _is_junk(tail):
+            return ""
+        if _stem_is_ui_verb(stem):
+            return ""
+        # The stem must itself be identifier-shaped or empty (some
+        # CMSes prefix the comma directly on a typed slug). A pure
+        # lower-case phrase is rejected.
+        if stem and not _is_identifier_shaped(stem):
+            return ""
+        # The tail standalone must pass the shape gate, which now
+        # rejects bare 1-3 digit numbers and pure-digit strings.
+        if not _slug_passes_shape(tail):
+            return ""
+        return tail
+
     last = last.strip(".,;:")
     if not last or len(last) < 3:
         return ""
@@ -126,6 +203,9 @@ def _from_slug(url: str) -> str:
         return ""
     stem = last.rsplit(".", 1)[0] if "." in last else last
     if _NAV_ROOT.match(stem):
+        return ""
+    # No-comma path: reject CTA/UI-verb slugs at the segment level.
+    if _stem_is_ui_verb(stem):
         return ""
     if not _is_identifier_shaped(stem):
         return ""
