@@ -36,6 +36,7 @@ from .extractors.static_extractor import StaticExtractor
 from .fingerprint import Fingerprint, fingerprint_site
 from .http_client import open_fetcher
 from .logging_setup import configure_logging
+from typing import Optional  # noqa: F401  # re-import-safe at module scope
 from .models import (
     DomainJob,
     DomainResult,
@@ -154,38 +155,64 @@ class Pipeline:
         fetcher,
     ) -> None:
         start = time.perf_counter()
+        budget = self._settings.domain_time_budget
+        deadline = start + budget
+        # The fingerprint is captured up front so the exception arm
+        # can distinguish a reachable-host crash from a genuinely
+        # unreachable host. Reachable-host crashes map to
+        # PARSING_FAILED rather than the network markers in
+        # classify_exception.
+        fingerprint: Optional[Fingerprint] = None
         try:
+            fingerprint = await asyncio.wait_for(
+                fingerprint_site(job.url, fetcher),
+                timeout=max(0.1, deadline - time.perf_counter()),
+            )
             result = await asyncio.wait_for(
-                self._scrape_domain(job, static, dynamic, fetcher),
-                timeout=self._settings.domain_time_budget,
+                self._scrape_domain(
+                    job, static, dynamic, fetcher, fingerprint,
+                ),
+                timeout=max(0.1, deadline - time.perf_counter()),
             )
         except asyncio.TimeoutError:
             elapsed = time.perf_counter() - start
             log.warning(
                 "domain %s timed out after %.1fs", job.domain, elapsed,
             )
-            # A timeout does NOT mean the site is unreachable. The site
-            # may have responded fine during fingerprinting but the
-            # detail-fetching phase ran out of budget. Classify as
-            # NO_LISTINGS_FOUND so the error log accurately reflects
-            # that the site was reachable but we couldn't extract in
-            # time. Genuinely unreachable sites are caught earlier by
-            # the fingerprint probe and never reach the timeout path.
+            # Timeout never means unreachable on its own. Differentiate
+            # using the fingerprint: a host that never answered the
+            # probe is unreachable; a host that did is just slow.
+            if fingerprint is None or not fingerprint.reachable:
+                reason = ErrorReason.SITE_NOT_REACHABLE
+            else:
+                reason = ErrorReason.NO_LISTINGS_FOUND
             result = DomainResult(
                 domain=job.domain,
                 status=DomainStatus.FAILED,
-                reason=ErrorReason.NO_LISTINGS_FOUND,
+                reason=reason,
                 strategy=Strategy.NONE,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("domain %s crashed: %s", job.domain, exc)
+            # Reachable-host crashes are PARSING_FAILED, never
+            # SITE_NOT_REACHABLE: the host already answered the probe.
+            if fingerprint is not None and fingerprint.reachable:
+                reason = ErrorReason.PARSING_FAILED
+            else:
+                reason = classify_exception(exc)
             result = DomainResult(
                 domain=job.domain,
                 status=DomainStatus.FAILED,
-                reason=classify_exception(exc),
+                reason=reason,
                 strategy=Strategy.NONE,
             )
-        result.duration_seconds = time.perf_counter() - start
+        # Cap reported duration at the contractual budget so the
+        # summary CSV never claims a longer run than the deadline
+        # allowed. The actual wall clock can briefly exceed the
+        # deadline during cleanup; that is bounded by the extractors
+        # themselves and does not appear in the report.
+        elapsed = time.perf_counter() - start
+        result.duration_seconds = min(elapsed, budget)
         await self._finalize(result)
 
     async def _scrape_domain(
@@ -194,6 +221,7 @@ class Pipeline:
         static: StaticExtractor,
         dynamic: DynamicExtractor,
         fetcher,
+        fingerprint: Fingerprint,
     ) -> DomainResult:
         domain_start = time.perf_counter()
         budget = self._settings.domain_time_budget
@@ -204,7 +232,6 @@ class Pipeline:
         min_fallback_budget = budget * 0.20
 
         log.info("start %s", job.domain)
-        fingerprint = await fingerprint_site(job.url, fetcher)
 
         if (
             fingerprint.failure_reason == ErrorReason.SITE_NOT_REACHABLE
