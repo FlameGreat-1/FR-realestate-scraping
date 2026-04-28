@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from selectolax.parser import HTMLParser
 
@@ -45,10 +45,20 @@ _REFERENCE_SHAPE = re.compile(
 # Markers that prove a breadcrumb candidate is actually a property
 # descriptor (price, surface, rent term), not a place name.
 _DESCRIPTOR_TOKENS = re.compile(
-    r"\u20ac|eur(?:o|os)?|/\s*mois|par\s+mois|m\s*[²²2]|\bm2\b",
+    r"\u20ac|eur(?:o|os)?|/\s*mois|par\s+mois|m\s*[\u00b2\u00b22]|\bm2\b",
     re.IGNORECASE,
 )
 _TWO_DIGIT_RUNS = re.compile(r"\d{2,}")
+# Reference labels ("Réf. : 417", "Ref 12345") are not place names.
+_REFERENCE_LABEL = re.compile(r"\br[\u00e9e]f\b", re.IGNORECASE)
+# Per-token markers used by the URL-slug fallback. After URL-decoding,
+# slug tokens carrying any of these are property descriptors, never
+# place names. The `digit-then-e` token (`900e`) is the French shorthand
+# for `\u20ac` in URL slugs.
+_SLUG_DESCRIPTOR_TOKEN = re.compile(
+    r"\u20ac|^\d+[a-z]?[\u00b2\u00b22]?$|\bm2\b|m\s*[\u00b2\u00b22]|mois|^\d+e$",
+    re.IGNORECASE,
+)
 
 # Words that look like cities to a naive scanner but never are. Sourced
 # from the navigation, breadcrumb, and template strings observed across
@@ -81,6 +91,17 @@ _NAV_LABELS: frozenset[str] = frozenset({
     "mon compte", "mon espace", "espace client", "espace candidat",
     "connexion", "se connecter", "deconnexion", "inscription",
     "dashboard", "bienvenue",
+    # Round 4 additions: page-flow labels surfaced by the audit.
+    "transaction", "transactions",
+    "decouvrir", "decouvrez",
+    "voir", "voir plus", "voir tous", "voir tout",
+    "tous les biens", "tous nos biens",
+    "derniers biens", "nouveautes", "nouveaute",
+    "coup de coeur", "coups de coeur",
+    "exclusivites", "exclusivite",
+    "selection", "selections",
+    "nos biens", "nos selections", "nos exclusivites", "nos coups",
+    "best of", "top", "top biens",
 })
 
 # Property-type tokens we want to filter out of URL-derived slugs.
@@ -113,12 +134,14 @@ def _is_nav_label(value: str) -> bool:
 def _breadcrumb_is_descriptor(value: str) -> bool:
     """Reject breadcrumb candidates that are clearly property descriptors.
 
-    Real cities never carry a EUR sign, an "m^2", a "/mois", or two
-    separate digit runs.
+    Real cities never carry a EUR sign, an "m^2", a "/mois", a
+    "Réf." / "Ref" prefix, or two separate digit runs.
     """
     if not value:
         return False
     if _DESCRIPTOR_TOKENS.search(value):
+        return True
+    if _REFERENCE_LABEL.search(value):
         return True
     if len(_TWO_DIGIT_RUNS.findall(value)) >= 2:
         return True
@@ -207,6 +230,26 @@ def _from_url_postal(url: str) -> str:
     return f"{last.capitalize()} {postal}"
 
 
+def _slug_token_is_descriptor(token: str) -> bool:
+    """True if a single URL-decoded slug token is a property descriptor.
+
+    Cosialis-class URLs surfaced this defect: tokens like `27m²`,
+    `900e`, `mois`, `€`, `m2` are surface / rent / currency markers,
+    not place names. We reject them at the per-token level so the
+    final commune candidate cannot be assembled out of them.
+    """
+    if not token:
+        return True
+    if "%" in token:
+        # Token still carries a percent-encoded fragment after
+        # `unquote` - the original URL was double-encoded or carried
+        # invalid sequences. Either way, not a place name.
+        return True
+    if _SLUG_DESCRIPTOR_TOKEN.search(token):
+        return True
+    return False
+
+
 def _from_url_slug(url: str) -> str:
     """Pull a commune name from category-anchored URL slugs.
 
@@ -222,10 +265,16 @@ def _from_url_slug(url: str) -> str:
     if not url:
         return ""
     parsed = urlparse(url)
-    path = (parsed.path or "").lower()
-    if not path:
+    raw_path = parsed.path or ""
+    if not raw_path:
         return ""
-    segments = [seg for seg in path.split("/") if seg]
+    # URL-decode FIRST. Cosialis-class URLs ship `%c2%b2` (m\u00b2 surface
+    # marker) and `%20` (space) inside slug tokens; without decoding,
+    # the tokens look opaque and slip past the descriptor filter.
+    decoded_path = unquote(raw_path).lower()
+    if not decoded_path:
+        return ""
+    segments = [seg for seg in decoded_path.split("/") if seg]
     if not segments:
         return ""
     has_category = any(
@@ -265,6 +314,9 @@ def _from_url_slug(url: str) -> str:
             if normalize_for_match(tok) not in _NAV_LABELS
             and tok not in _URL_CATEGORY_TOKENS
         ]
+        # Drop property-descriptor tokens (m\u00b2, \u20ac, /mois, rent shorthand).
+        if any(_slug_token_is_descriptor(tok) for tok in tokens):
+            continue
         if not tokens:
             continue
         joined = " ".join(tok.capitalize() for tok in tokens)
