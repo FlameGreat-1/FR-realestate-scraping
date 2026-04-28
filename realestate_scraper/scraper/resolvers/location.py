@@ -4,15 +4,24 @@ We collect, in order of confidence:
     1. JSON-LD `address` already normalised by `utils.json_ld`.
     2. The French URL pattern `<slug>-<postal_code>` or
        `/<postal_code>-<slug>` (`...-bordeaux-33000`, `/33000-bordeaux/`).
-    3. The breadcrumb trail's best place-shaped node (NOT just the
+    3. The page title and h1: `à <Commune>` and `<Commune> <postal>`
+       shapes - the strongest in-page signal on franchise / CMS
+       templates whose detail URLs ship neither a postal code nor a
+       category-anchored slug (Nestenn `-ref-XXXXX` URLs).
+    4. The breadcrumb trail's best place-shaped node (NOT just the
        last alphabetic one - that catches "Maison", "Accueil", title
        descriptors carrying "39m^2" or "1 007 EUR/mois", etc.).
-    4. The URL category-then-commune slug (`/ventes-maisons-t4-toulon/...`)
+    5. The URL category-then-commune slug (`/ventes-maisons-t4-toulon/...`)
        which is the dominant pattern on Apimo / Hektor templates that
        do not embed a postal code in their listing URLs.
-    5. `og:locality` / `place:location:locality` meta tags.
-    6. The agency CSV city/postcode, but ONLY for pages that look like
-       real detail pages, never for hubs / contact / template pages.
+    6. The first `<Commune> <postal>` co-occurrence in the page body
+       text. Catches detail pages whose template renders the address
+       in a `.contact` / `.localisation` block without breadcrumb or
+       title evidence.
+    7. `og:locality` / `place:location:locality` meta tags.
+    8. The agency CSV city/postcode, last resort, only when every
+       in-page tier above returned empty AND the page is detail-
+       shaped. Hubs / contact pages never adopt the CSV locality.
 
 The output is a free-form string (the brief stores `location` as text).
 """
