@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from ..browser_pool import BrowserPool
@@ -91,12 +92,18 @@ class DynamicExtractor:
         settings: Settings,
         browser_pool: BrowserPool,
         fetcher: HttpFetcher,
+        *,
+        parse_pool: Optional[ThreadPoolExecutor] = None,
     ) -> None:
         self._settings = settings
         self._pool = browser_pool
         self._fetcher = fetcher
         self._discovery = CandidateDiscovery(settings, fetcher)
         self._listing_sem = asyncio.Semaphore(settings.listing_concurrency)
+        # Explicit parse pool: never the loop's default executor.
+        # The loop's default pool is shared with Playwright's chromium
+        # IPC; mixing parse jobs onto it stalls the driver pipe.
+        self._parse_pool = parse_pool
 
     @property
     def is_available(self) -> bool:
@@ -122,6 +129,7 @@ class DynamicExtractor:
         results: list[Listing] = []
         seen_keys: set[str] = set()
         listing_budget = self._settings.listing_time_budget
+        loop = asyncio.get_running_loop()
 
         # Mutable counter shared across all _get_html calls in this
         # gather. Tracks total Playwright escalation attempts so we
@@ -132,15 +140,15 @@ class DynamicExtractor:
             html = await self._get_html(url, escalation_count)
             if not html:
                 return None
-            # CPU-bound parse + resolver work runs OFF the event loop.
-            # selectolax and the regex engine do NOT yield to asyncio,
-            # so calling this synchronously here would freeze every
-            # other domain coroutine until the call returned. The
-            # to_thread handoff lets `asyncio.wait_for` actually
-            # fire on the listing_time_budget and lets other
-            # coroutines progress while CPU work is in flight.
-            return await asyncio.to_thread(
-                parse_and_build_listing, url, html, job,
+            # CPU-bound parse + resolver work runs OFF the event loop
+            # on the dedicated parse pool, NOT the loop's default
+            # executor. The default pool is shared with Playwright's
+            # chromium IPC; saturating it with parse jobs stalls the
+            # driver pipe and produces TargetClosedError cascades.
+            return await loop.run_in_executor(
+                self._parse_pool,
+                parse_and_build_listing,
+                url, html, job,
             )
 
         async def _bounded_process(url: str) -> Optional[Listing]:
