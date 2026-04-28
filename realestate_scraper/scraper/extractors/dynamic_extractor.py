@@ -54,6 +54,17 @@ log = logging.getLogger(__name__)
 
 _BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 429})
 
+# Opportunistic post-domcontentloaded settle wait. Capped low enough
+# that a slow site cannot dominate the per-domain budget, and high
+# enough to let JS redirects / WAF interstitials complete before we
+# read `page.content()` (which is what causes the "Execution context
+# destroyed" race when the wait is omitted).
+_NETWORK_IDLE_TIMEOUT_MS: int = 2_000
+# Brief settle delay between render attempts. A navigation race
+# almost always resolves on the second try because the redirect /
+# challenge has had time to complete.
+_RETRY_SETTLE_SECONDS: float = 0.4
+
 
 class DynamicExtractor:
     """Listings extractor that uses Playwright only where it is needed."""
@@ -133,21 +144,17 @@ class DynamicExtractor:
         return ""
 
     async def _render_with_playwright(self, url: str) -> str:
-        """Last-resort per-page Playwright render. Errors swallowed by design."""
-        nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
-        try:
-            async with self._pool.page(target_url=url) as page:
-                response = await page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=nav_timeout_ms,
-                )
-                if response is None or response.status >= 400:
-                    return ""
-                return await page.content() or ""
-        except Exception as exc:  # noqa: BLE001
-            log.debug("dynamic page render %s failed: %s", url, exc)
-            return ""
+        """Last-resort per-page Playwright render with race-safe content read."""
+        for attempt in (1, 2):
+            html = await self._safe_render(url, target_url=url)
+            if html:
+                return html
+            if attempt == 1:
+                # Brief settle delay before retrying. A navigation race
+                # almost always resolves on the second attempt because
+                # the redirect / WAF challenge has had time to complete.
+                await asyncio.sleep(_RETRY_SETTLE_SECONDS)
+        return ""
 
     async def _render_homepage(self, job: DomainJob) -> tuple[str, str]:
         """Render the homepage in Playwright, return (html, final_url).
@@ -156,21 +163,81 @@ class DynamicExtractor:
         fingerprint's cached HTML so a flaky Playwright launch does
         not cost us all coverage on the domain.
         """
+        for attempt in (1, 2):
+            html, final_url = await self._safe_render(
+                job.url, target_url=job.url, return_final_url=True,
+            )
+            if html:
+                return html, final_url or job.url
+            if attempt == 1:
+                await asyncio.sleep(_RETRY_SETTLE_SECONDS)
+        return "", ""
+
+    async def _safe_render(
+        self,
+        url: str,
+        *,
+        target_url: str,
+        return_final_url: bool = False,
+    ):
+        """Render `url` once, returning HTML (and optionally the final URL).
+
+        Layered waits handle two distinct failure modes:
+          * `domcontentloaded` is the primary wait: fast, sufficient
+            for the majority of pages.
+          * `networkidle` is an opportunistic secondary wait capped at
+            `_NETWORK_IDLE_TIMEOUT_MS`. It lets JS redirects and WAF
+            interstitials resolve before we read `page.content()`,
+            which is what eliminates the "Execution context
+            destroyed" race observed on Round 3.
+          * `page.content()` is wrapped in a try/except: a navigation
+            race that kills the execution context surfaces as a
+            Playwright Error, and the caller will retry once.
+          * Status >= 400 is no longer fatal. WAF sites (Cloudflare,
+            Imperva, ...) routinely serve a 403 interstitial whose
+            JS then redirects to the real homepage. We let the
+            redirect happen (via the networkidle wait) and read the
+            post-redirect HTML regardless of the initial status.
+        """
         nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
         try:
-            async with self._pool.page(target_url=job.url) as page:
-                response = await page.goto(
-                    job.url,
-                    wait_until="domcontentloaded",
-                    timeout=nav_timeout_ms,
-                )
-                if response is None or response.status >= 400:
-                    return "", ""
-                html = await page.content()
-                return html or "", str(page.url) or job.url
+            async with self._pool.page(target_url=target_url) as page:
+                try:
+                    await page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=nav_timeout_ms,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("dynamic goto %s failed: %s", url, exc)
+                    return ("", "") if return_final_url else ""
+                # Opportunistic networkidle wait. A timeout is fine -
+                # we proceed with whatever DOM is available.
+                try:
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=_NETWORK_IDLE_TIMEOUT_MS,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    html = await page.content()
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "dynamic content() %s failed (race): %s",
+                        url, exc,
+                    )
+                    return ("", "") if return_final_url else ""
+                final_url = ""
+                try:
+                    final_url = str(page.url) or url
+                except Exception:  # noqa: BLE001
+                    final_url = url
+                if return_final_url:
+                    return html or "", final_url
+                return html or ""
         except Exception as exc:  # noqa: BLE001
-            log.debug("dynamic homepage harvest %s failed: %s", job.url, exc)
-            return "", ""
+            log.debug("dynamic page session %s failed: %s", url, exc)
+            return ("", "") if return_final_url else ""
 
     async def _discover_candidates(
         self,
