@@ -176,6 +176,7 @@ class BrowserPool:
         await self._semaphore.acquire()
         context = None
         page = None
+        context_healthy = True
         try:
             context = await self._acquire_context()
             profile = (
@@ -203,13 +204,33 @@ class BrowserPool:
             )
             yield page
         finally:
-            try:
-                if page is not None:
-                    await page.close()
-            except Exception:  # noqa: BLE001
-                pass
+            # Page close with a hard 3s timeout. A broken Playwright
+            # connection can hang page.close() indefinitely, which
+            # blocks the semaphore release and permanently reduces
+            # browser pool capacity.
+            if page is not None:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=3.0)
+                except Exception:  # noqa: BLE001
+                    # Page close failed or timed out. The context may
+                    # have corrupted state; mark it unhealthy so we
+                    # discard it instead of returning to the idle pool.
+                    context_healthy = False
             if context is not None:
-                self._release_context(context)
+                if context_healthy:
+                    self._release_context(context)
+                else:
+                    # Discard the corrupted context. A fresh one will
+                    # be built on next borrow. Remove from tracking
+                    # so close() doesn't double-close it.
+                    try:
+                        self._all_contexts.remove(context)
+                    except ValueError:
+                        pass
+                    try:
+                        await asyncio.wait_for(context.close(), timeout=3.0)
+                    except Exception:  # noqa: BLE001
+                        pass
             self._semaphore.release()
 
 
