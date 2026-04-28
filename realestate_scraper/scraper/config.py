@@ -68,23 +68,28 @@ class Settings(BaseSettings):
     )
     accept_language: str = Field(default="fr-FR,fr;q=0.9,en;q=0.7")
     enable_playwright: bool = Field(default=True)
-    # Geocoding fills `coordinates` for listings whose pages do not
-    # ship lat/lng in any in-page form (no JSON-LD geo, no
-    # `data-lat`/`data-lng`, no map iframe). The pipeline applies a
-    # cache-only fast path first, then resolves the remainder under
-    # a hard wall-clock budget so a cold cache cannot blow the
-    # per-domain time budget. At 55k+ scale the operator can flip
-    # this off via the `ENABLE_GEOCODING` environment variable if a
-    # managed-quota geocoder is preferred.
+    # Geocoding fills `coordinates` for listings whose pages did not
+    # ship lat/lng in any in-page form. Architecturally the geocoder
+    # runs as a SINGLE post-pass after every domain has finished
+    # scraping, NEVER on the per-domain hot path - that's the only
+    # safe shape under the Nominatim 1-req/s policy at high domain
+    # concurrency. At 55k+ scale the operator can flip this off via
+    # the `ENABLE_GEOCODING` environment variable.
     enable_geocoding: bool = Field(default=True)
     geocoder_user_agent: str = Field(default="realestate_scraper/1.0")
     geocoder_timeout: float = Field(default=3.0, gt=0)
-    # Hard wall-clock cap on the geocoder enrichment pass per domain.
-    # The pre-pass cache lookups always run; only the cold-lookup
-    # phase is bounded. 30 s comfortably fits inside the 90 s domain
-    # budget while leaving headroom for ~30 cold Nominatim calls
-    # (1 req/s rate limit, plus per-call latency).
-    geocoder_enrichment_budget: float = Field(default=30.0, ge=0)
+    # Hard wall-clock cap on the geocoder POST-PASS (after every
+    # domain has finished scraping). When exhausted, listings whose
+    # coordinates were not yet resolved stay empty - partial coverage
+    # is preferable to an unbounded run. 60 s lets ~60 unique cold
+    # lookups complete on a fully cold cache, while leaving cache-
+    # warm runs effectively free.
+    geocoder_post_pass_budget: float = Field(default=60.0, ge=0)
+    # Deprecated: kept on the model so old .env files do not crash on
+    # load. The geocoder no longer runs on the per-domain hot path,
+    # so this setting has no effect. Will be removed in a future
+    # round.
+    geocoder_enrichment_budget: float = Field(default=0.0, ge=0)
 
     # --- Retries ---
     # 1 retry covers transient socket / TLS errors. Persistent
