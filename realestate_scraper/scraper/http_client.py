@@ -297,10 +297,12 @@ async def open_fetcher(settings: Settings) -> AsyncIterator[HttpFetcher]:
     limits = httpx.Limits(
         max_keepalive_connections=settings.domain_concurrency * 4,
         max_connections=settings.domain_concurrency * 8,
-        # Shorter keepalive: idle connections from processed domains
-        # hold pool slots that active domains need. At scale, 30s
-        # keepalive on hundreds of hosts wastes connection capacity.
-        keepalive_expiry=15.0,
+        # Short keepalive: idle connections from processed domains hold
+        # pool slots that active domains need, AND a server-side-closed
+        # idle connection that gets reused before httpx notices the
+        # close raises read errors. 5s amortises TLS handshake within
+        # one domain's listing burst without lingering across domains.
+        keepalive_expiry=5.0,
     )
     timeout = httpx.Timeout(
         connect=min(settings.http_probe_timeout, 6.0),
@@ -312,10 +314,26 @@ async def open_fetcher(settings: Settings) -> AsyncIterator[HttpFetcher]:
         # and move on, rather than blocking silently in the pool queue.
         pool=5.0,
     )
+    # HTTP/2 is deliberately OFF.
+    #
+    # httpx + h2 + asymmetric server-side close (common on Cloudflare
+    # and Imperva-fronted hosts in the input set) produces unrecoverable
+    # hpack errors:
+    #
+    #   Invalid input ConnectionInputs.SEND_SETTINGS in state
+    #   ConnectionState.CLOSED
+    #
+    # The error is per-connection but crashes the calling coroutine,
+    # which - at high domain_concurrency - removes the entire domain
+    # from the run. HTTP/1.1 with keepalive gives equivalent real-world
+    # throughput at our concurrency (per_host=6, listing=24): the
+    # multiplexing win is negligible at 6 concurrent requests per host,
+    # and the dominant cost is TLS handshake, which keepalive already
+    # amortises identically under H1.1.
     transport = httpx.AsyncHTTPTransport(
         retries=0,
         verify=settings.verify_tls,
-        http2=True,
+        http2=False,
     )
 
     # The client itself does not hold the per-request UA: each call to
@@ -329,7 +347,7 @@ async def open_fetcher(settings: Settings) -> AsyncIterator[HttpFetcher]:
         timeout=timeout,
         transport=transport,
         verify=settings.verify_tls,
-        http2=True,
+        http2=False,
     ) as client:
         host_limiter = HostLimiter(settings.per_host_concurrency)
         fetcher = HttpFetcher(
