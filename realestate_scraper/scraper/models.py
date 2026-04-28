@@ -34,6 +34,22 @@ LISTING_FIELDS: tuple[str, ...] = (
 
 ERROR_FIELDS: tuple[str, ...] = ("domain", "status", "reason")
 
+# Path fragments that prove the source URL is a CMS / informational
+# page rather than a real property detail page. These pages routinely
+# carry a single euro amount (an agency fee, a tax illustration, a
+# headline) plus the agency name, and would otherwise pass the
+# field-count anchor in `Listing.is_publishable`. The guard is an
+# additional check on top of the existing rules; it never widens
+# acceptance, only narrows it.
+_NON_LISTING_URL_FRAGMENTS: tuple[str, ...] = (
+    "/i/redac/", "/honoraires", "/mentions", "/cookies",
+    "/privacy", "/cgu", "/cgv", "/legal",
+    "/contact", "/equipe", "/team",
+    "/agences/", "/actualites/",
+    "/blog/", "/article/", "/news/",
+    "/page/",
+)
+
 DOMAIN_SUMMARY_FIELDS: tuple[str, ...] = (
     "domain",
     "status",
@@ -141,6 +157,15 @@ class Listing:
         """
         def _set(value: str) -> bool:
             return bool((value or "").strip())
+
+        # CMS / informational page guard: reject before counting
+        # informative fields so a page with a fee amount + agency
+        # metadata cannot leak through the price-anchor branch.
+        url_path = (self.source_url or "").lower().split("?", 1)[0]
+        if url_path:
+            for fragment in _NON_LISTING_URL_FRAGMENTS:
+                if fragment in url_path:
+                    return False
 
         informative = (
             self.price, self.location, self.surface_area,

@@ -91,6 +91,23 @@ _UI_VERB_ROOTS: frozenset[str] = frozenset({
 
 _VP_VM = re.compile(r"\b([A-Z]{1,3}\d{3,})\b")
 
+# Franchise / CMS URL-tail patterns. The slug-shape gate enforces a
+# `_MAX_SLUG_HYPHENS=3` budget which legitimately rejects the long
+# descriptive slugs Nestenn / ERA / Century21 / Hektor templates emit.
+# These patterns recover the embedded reference identifier from those
+# tails directly. They are deliberately anchored on the URL string
+# (path + query) and do not look at body text.
+#   * `-ref-<digits>`         Nestenn, ERA, generic Apimo: 4+ digits.
+#   * `-fp<digits>`           Century 21: 4+ digits.
+#   * `,<acronym><digits>`    Hektor / Periscope: 1-3 letter prefix +
+#                             3+ digits, anchored on a comma so a bare
+#                             trailing number (page index) is rejected.
+_URL_TAIL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"-ref-?(\d{4,})(?:[/?,]|$)", re.IGNORECASE),
+    re.compile(r"-fp(\d{4,})(?:[/?,]|$)", re.IGNORECASE),
+    re.compile(r",([A-Za-z]{1,3}\d{3,})(?:[/?,]|$)"),
+)
+
 # An identifier-shaped token: must contain at least one digit, OR mixed
 # case, OR an internal separator. Bare lower-case words fail.
 _IDENTIFIER_SHAPE = re.compile(
@@ -257,6 +274,15 @@ class ReferenceResolver:
         vp_match = _VP_VM.search(ctx.url or "")
         if vp_match:
             return ResolverResult(vp_match.group(1), 0.7, "url_pattern")
+
+        url = ctx.url or ""
+        if url:
+            for pattern in _URL_TAIL_PATTERNS:
+                tail_match = pattern.search(url)
+                if tail_match:
+                    return ResolverResult(
+                        tail_match.group(1), 0.7, "url_pattern",
+                    )
 
         slug = _from_slug(ctx.url)
         if slug:
