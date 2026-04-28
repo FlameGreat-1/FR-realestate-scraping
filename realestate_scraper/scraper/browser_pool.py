@@ -115,24 +115,49 @@ class BrowserPool:
         return True
 
     async def close(self) -> None:
+        """Tear down the browser, capped at 10s wall-clock.
+
+        Each step (context.close, browser.close, playwright.stop) talks
+        to the chromium driver over a pipe that may already be closing
+        - exactly what happens during Ctrl-C cancellation. Without a
+        wall-clock cap the close hangs indefinitely waiting for
+        replies that will never come, blocking process exit and
+        producing the 'pipe closed by peer' loop the user sees. After
+        10s we abandon the chromium subprocess; the OS reaps it on
+        Python exit, equivalent to a kill.
+        """
+        try:
+            await asyncio.wait_for(self._close_inner(), timeout=10.0)
+        except asyncio.TimeoutError:
+            log.warning(
+                "browser pool close exceeded 10s, abandoning chromium",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("browser pool close error: %s", exc)
+
+    async def _close_inner(self) -> None:
         async with self._lock:
             for context in self._all_contexts:
                 try:
-                    await context.close()
-                except Exception as exc:  # noqa: BLE001
+                    await asyncio.wait_for(context.close(), timeout=2.0)
+                except BaseException as exc:  # noqa: BLE001
                     log.debug("context close: %s", exc)
             self._all_contexts.clear()
             self._idle_contexts.clear()
             if self._browser is not None:
                 try:
-                    await self._browser.close()
-                except Exception as exc:  # noqa: BLE001
+                    await asyncio.wait_for(
+                        self._browser.close(), timeout=3.0,
+                    )
+                except BaseException as exc:  # noqa: BLE001
                     log.debug("browser close: %s", exc)
                 self._browser = None
             if self._playwright is not None:
                 try:
-                    await self._playwright.stop()
-                except Exception as exc:  # noqa: BLE001
+                    await asyncio.wait_for(
+                        self._playwright.stop(), timeout=3.0,
+                    )
+                except BaseException as exc:  # noqa: BLE001
                     log.debug("playwright stop: %s", exc)
                 self._playwright = None
 
@@ -234,32 +259,50 @@ class BrowserPool:
             self._semaphore.release()
 
 
+_ROUTE_ACTION_TIMEOUT: float = 1.0
+
+
 async def _route_handler(route: Any) -> None:
     """Block heavy / tracking resources to keep dynamic runs fast.
 
-    Every route action (abort / continue) is wrapped in try/except
-    because the browser context or page can be closed at any moment
-    by domain-level timeout cancellation. An unhandled exception here
-    cascades as a TargetClosedError / "Connection closed while reading
-    from the driver" that poisons the entire browser process.
+    Each route action is wrapped in `wait_for` AND a broad except.
+    During domain-level cancellation Playwright still fires this
+    handler one last time per in-flight request; the underlying
+    `route.continue_()` / `route.abort()` then waits for a reply on
+    the closing driver pipe. Without the time cap, those calls hang
+    until Playwright tears the connection down, and each hang
+    surfaces as 'Route.continue_: Connection closed while reading
+    from the driver' - hundreds per cancelled domain in the user's
+    run log. We bound the wait at 1s and swallow every error: the
+    page is being closed regardless, so whether the route was
+    aborted, continued, or neither does not affect correctness.
     """
     try:
         request = route.request
         if request.resource_type in _BLOCKED_RESOURCE_TYPES:
             try:
-                await route.abort()
-            except Exception:  # noqa: BLE001
+                await asyncio.wait_for(
+                    route.abort(), timeout=_ROUTE_ACTION_TIMEOUT,
+                )
+            except BaseException:  # noqa: BLE001
                 pass
             return
         url = request.url.lower()
         if any(fragment in url for fragment in _BLOCKED_URL_FRAGMENTS):
             try:
-                await route.abort()
-            except Exception:  # noqa: BLE001
+                await asyncio.wait_for(
+                    route.abort(), timeout=_ROUTE_ACTION_TIMEOUT,
+                )
+            except BaseException:  # noqa: BLE001
                 pass
             return
-        await route.continue_()
-    except Exception:  # noqa: BLE001
-        # Context/page was closed during cancellation. Swallow silently
-        # to prevent the error cascade seen in the run logs.
+        try:
+            await asyncio.wait_for(
+                route.continue_(), timeout=_ROUTE_ACTION_TIMEOUT,
+            )
+        except BaseException:  # noqa: BLE001
+            pass
+    except BaseException:  # noqa: BLE001
+        # Driver pipe is gone. Nothing we can do. Suppress to prevent
+        # the cascade observed in the user's run output.
         pass
