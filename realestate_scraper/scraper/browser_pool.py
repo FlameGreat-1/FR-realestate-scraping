@@ -214,19 +214,31 @@ class BrowserPool:
 
 
 async def _route_handler(route: Any) -> None:
-    """Block heavy / tracking resources to keep dynamic runs fast."""
-    request = route.request
-    if request.resource_type in _BLOCKED_RESOURCE_TYPES:
-        try:
-            await route.abort()
-        except Exception:  # noqa: BLE001
-            await route.continue_()
-        return
-    url = request.url.lower()
-    if any(fragment in url for fragment in _BLOCKED_URL_FRAGMENTS):
-        try:
-            await route.abort()
-        except Exception:  # noqa: BLE001
-            await route.continue_()
-        return
-    await route.continue_()
+    """Block heavy / tracking resources to keep dynamic runs fast.
+
+    Every route action (abort / continue) is wrapped in try/except
+    because the browser context or page can be closed at any moment
+    by domain-level timeout cancellation. An unhandled exception here
+    cascades as a TargetClosedError / "Connection closed while reading
+    from the driver" that poisons the entire browser process.
+    """
+    try:
+        request = route.request
+        if request.resource_type in _BLOCKED_RESOURCE_TYPES:
+            try:
+                await route.abort()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        url = request.url.lower()
+        if any(fragment in url for fragment in _BLOCKED_URL_FRAGMENTS):
+            try:
+                await route.abort()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        await route.continue_()
+    except Exception:  # noqa: BLE001
+        # Context/page was closed during cancellation. Swallow silently
+        # to prevent the error cascade seen in the run logs.
+        pass
