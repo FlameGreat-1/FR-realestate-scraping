@@ -44,7 +44,10 @@ class Settings(BaseSettings):
     # --- Timeouts ---
     http_probe_timeout: float = Field(default=8.0, gt=0)
     http_fetch_timeout: float = Field(default=15.0, gt=0)
-    domain_time_budget: float = Field(default=180.0, gt=0)
+    # 90s caps wall-clock at (jobs / workers) * 90 for the worst case.
+    # The pipeline already escalates static -> dynamic -> per-page
+    # Playwright internally, so 180s is no longer needed.
+    domain_time_budget: float = Field(default=90.0, gt=0)
     browser_nav_timeout: float = Field(default=20.0, gt=0)
 
     # --- Limits ---
@@ -70,7 +73,10 @@ class Settings(BaseSettings):
     geocoder_timeout: float = Field(default=3.0, gt=0)
 
     # --- Retries ---
-    http_max_retries: int = Field(default=2, ge=0, le=10)
+    # 1 retry covers transient socket / TLS errors. Persistent
+    # failures are handled by the dynamic-extractor escalation path
+    # rather than re-issuing the same failing request multiple times.
+    http_max_retries: int = Field(default=1, ge=0, le=10)
     http_retry_backoff: float = Field(default=0.5, ge=0)
 
     # --- Logging ---
