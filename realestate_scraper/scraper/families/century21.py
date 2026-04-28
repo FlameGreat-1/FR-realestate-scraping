@@ -20,6 +20,7 @@ CENTURY21 = Family(
     # Detail pages serve usable static HTML; only search results
     # require JS. Pipeline escalates to dynamic on zero-listing static.
     requires_dynamic=False,
+    agency_index_paths=("/agences/",),
 )
 
 get_registry().register(CENTURY21)

@@ -49,6 +49,13 @@ from .utils.geocoder import AsyncGeocoder
 
 log = logging.getLogger(__name__)
 
+# Hard cap on the post-domain finalize step (CSV writes + checkpoint
+# flush). The same value the static and dynamic extractors use for
+# their cleanup gathers; sharing it keeps the wall-clock contract
+# (`domain_time_budget + _FINALIZE_CAP` worst case) consistent across
+# modules.
+_FINALIZE_CAP: float = 5.0
+
 
 class Pipeline:
     """Concurrent per-domain orchestrator."""
@@ -154,39 +161,74 @@ class Pipeline:
         fetcher,
     ) -> None:
         start = time.perf_counter()
+        budget = self._settings.domain_time_budget
+        deadline = start + budget
+        # The fingerprint is captured up front so the exception arm
+        # can distinguish a reachable-host crash from a genuinely
+        # unreachable host. Reachable-host crashes map to
+        # PARSING_FAILED rather than the network markers in
+        # classify_exception.
+        fingerprint: Optional[Fingerprint] = None
         try:
+            fingerprint = await asyncio.wait_for(
+                fingerprint_site(job.url, fetcher),
+                timeout=max(0.1, deadline - time.perf_counter()),
+            )
             result = await asyncio.wait_for(
-                self._scrape_domain(job, static, dynamic, fetcher),
-                timeout=self._settings.domain_time_budget,
+                self._scrape_domain(
+                    job, static, dynamic, fetcher, fingerprint,
+                ),
+                timeout=max(0.1, deadline - time.perf_counter()),
             )
         except asyncio.TimeoutError:
             elapsed = time.perf_counter() - start
             log.warning(
                 "domain %s timed out after %.1fs", job.domain, elapsed,
             )
-            # A timeout does NOT mean the site is unreachable. The site
-            # may have responded fine during fingerprinting but the
-            # detail-fetching phase ran out of budget. Classify as
-            # NO_LISTINGS_FOUND so the error log accurately reflects
-            # that the site was reachable but we couldn't extract in
-            # time. Genuinely unreachable sites are caught earlier by
-            # the fingerprint probe and never reach the timeout path.
+            # Timeout never means unreachable on its own. Differentiate
+            # using the fingerprint: a host that never answered the
+            # probe is unreachable; a host that did is just slow.
+            if fingerprint is None or not fingerprint.reachable:
+                reason = ErrorReason.SITE_NOT_REACHABLE
+            else:
+                reason = ErrorReason.NO_LISTINGS_FOUND
             result = DomainResult(
                 domain=job.domain,
                 status=DomainStatus.FAILED,
-                reason=ErrorReason.NO_LISTINGS_FOUND,
+                reason=reason,
                 strategy=Strategy.NONE,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("domain %s crashed: %s", job.domain, exc)
+            # Reachable-host crashes are PARSING_FAILED, never
+            # SITE_NOT_REACHABLE: the host already answered the probe.
+            if fingerprint is not None and fingerprint.reachable:
+                reason = ErrorReason.PARSING_FAILED
+            else:
+                reason = classify_exception(exc)
             result = DomainResult(
                 domain=job.domain,
                 status=DomainStatus.FAILED,
-                reason=classify_exception(exc),
+                reason=reason,
                 strategy=Strategy.NONE,
             )
+        # Wall-clock contract: the inner extractors cap their gather
+        # phases via configurable ratios; finalize is the only
+        # remaining work that could push past the budget on a slow
+        # disk. Bound it explicitly so an overrun cannot happen.
+        # `_FINALIZE_CAP` is the same conservative value the
+        # extractors use for their cleanup gathers, so the constants
+        # do not diverge across modules.
         result.duration_seconds = time.perf_counter() - start
-        await self._finalize(result)
+        try:
+            await asyncio.wait_for(
+                self._finalize(result), timeout=_FINALIZE_CAP,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "domain %s finalize exceeded %.1fs cap, result not flushed",
+                job.domain, _FINALIZE_CAP,
+            )
 
     async def _scrape_domain(
         self,
@@ -194,6 +236,7 @@ class Pipeline:
         static: StaticExtractor,
         dynamic: DynamicExtractor,
         fetcher,
+        fingerprint: Fingerprint,
     ) -> DomainResult:
         domain_start = time.perf_counter()
         budget = self._settings.domain_time_budget
@@ -204,7 +247,6 @@ class Pipeline:
         min_fallback_budget = budget * 0.20
 
         log.info("start %s", job.domain)
-        fingerprint = await fingerprint_site(job.url, fetcher)
 
         if (
             fingerprint.failure_reason == ErrorReason.SITE_NOT_REACHABLE
@@ -550,3 +592,9 @@ async def run_pipeline(
     # Geocoder post-pass: runs ONCE after every domain has finished,
     # on a single coroutine. Never on the per-domain hot path.
     await pipeline.run_geocode_post_pass()
+
+    # Human-readable summary derived from the three output CSVs.
+    # Purely informational; failures are logged and swallowed so
+    # they cannot mask a successful run.
+    from .report import generate_report
+    generate_report(settings)

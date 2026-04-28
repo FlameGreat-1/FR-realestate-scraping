@@ -27,6 +27,7 @@ from ..http_client import HttpFetcher
 from ..models import DomainJob, Listing
 from ..utils.url import dedup_key
 from .discovery import CandidateDiscovery
+from .dynamic_extractor import consume_orphan_exception
 from .pipeline_extract import parse_and_build_listing
 
 log = logging.getLogger(__name__)
@@ -70,12 +71,17 @@ class StaticExtractor:
         )
 
         # Hard wall-clock cap on the entire candidate gather. Mirrors
-        # the dynamic extractor's outer cap (MR !21). Without this the
-        # static path can run uncapped on slow Cloudflare-fronted hosts
-        # whose httpx fetches all hit fetch_timeout, generating enough
-        # loop traffic to starve the pipeline-level wait_for(120s).
-        # Sized to 70% of domain budget to leave finalisation headroom.
-        gather_budget = self._settings.domain_time_budget * 0.7
+        # the dynamic extractor's outer cap. Without this the static
+        # path can run uncapped on slow Cloudflare-fronted hosts whose
+        # httpx fetches all hit fetch_timeout, generating enough loop
+        # traffic to starve the pipeline-level wait_for. The ratio is
+        # configurable so operators can rebalance against the dynamic
+        # ratio when tuning a large corpus; default 0.55 leaves room
+        # for the hybrid fallback to engage on zero-listing static.
+        gather_budget = (
+            self._settings.domain_time_budget
+            * self._settings.static_gather_budget_ratio
+        )
 
         results: list[Listing] = []
         seen_keys: set[str] = set()
@@ -169,10 +175,12 @@ class StaticExtractor:
                     timeout=5.0,
                 )
             except asyncio.TimeoutError:
+                pending = [t for t in tasks if not t.done()]
+                for task in pending:
+                    task.add_done_callback(consume_orphan_exception)
                 log.debug(
                     "static: cleanup gather timed out for %s, "
                     "abandoning %d tasks",
-                    job.domain,
-                    sum(1 for t in tasks if not t.done()),
+                    job.domain, len(pending),
                 )
         return results

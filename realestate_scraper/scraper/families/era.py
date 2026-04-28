@@ -19,6 +19,7 @@ ERA = Family(
         r"/annonce[s]?/",
         r"-ref-?\d{4,}",
     ),
+    agency_index_paths=("/agences/",),
 )
 
 get_registry().register(ERA)

@@ -80,6 +80,16 @@ class Settings(BaseSettings):
     # so a URL that times out on fetch is dropped immediately rather
     # than consuming additional budget on parse attempts.
     listing_time_budget: float = Field(default=10.0, gt=0)
+    # Fraction of `domain_time_budget` that the static / dynamic
+    # extractors are allowed to spend in their candidate gather
+    # phase before yielding control back to the pipeline. Lowering
+    # the static ratio leaves headroom for the hybrid (static->
+    # dynamic) fallback to engage on slow hosts where the static
+    # path produces zero listings. Raising either ratio risks the
+    # outer domain timeout firing during cleanup. The two ratios
+    # need not sum to 1: only one gather runs at a time per domain.
+    static_gather_budget_ratio: float = Field(default=0.55, gt=0, le=1.0)
+    dynamic_gather_budget_ratio: float = Field(default=0.70, gt=0, le=1.0)
 
     # --- Behaviour ---
     verify_tls: bool = Field(default=False)

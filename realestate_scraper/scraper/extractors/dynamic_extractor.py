@@ -64,6 +64,26 @@ log = logging.getLogger(__name__)
 
 _BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 429})
 
+
+def consume_orphan_exception(task: asyncio.Task) -> None:
+    """Done-callback that retrieves an abandoned task's exception.
+
+    Called only on tasks that the cleanup gather abandoned because
+    they did not honour cancellation within the 5s window. Reading
+    the exception (and discarding it) marks the future as retrieved
+    so the asyncio garbage collector does not emit the cosmetic
+    `Future exception was never retrieved` warning.
+
+    Shared between the static and dynamic extractors; the symbol
+    is module-public so the cross-module import is intentional.
+    """
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
+
 # Post-domcontentloaded settle for homepage renders. Cloudflare and
 # Imperva interstitials redirect via short JS timer; 300ms is enough
 # for the redirect to fire and is far cheaper than waiting on
@@ -125,9 +145,13 @@ class DynamicExtractor:
         # pipeline-level domain_time_budget is the contract, but the
         # loop's timer wheel can be starved by chromium IPC traffic
         # under heavy browser-pool contention; an inner cap here
-        # guarantees we hand control back regardless. 70% of the
-        # domain budget leaves headroom for finalisation.
-        gather_budget = self._settings.domain_time_budget * 0.7
+        # guarantees we hand control back regardless. The ratio is
+        # configurable so operators can rebalance against the static
+        # ratio when tuning a large corpus.
+        gather_budget = (
+            self._settings.domain_time_budget
+            * self._settings.dynamic_gather_budget_ratio
+        )
 
         results: list[Listing] = []
         seen_keys: set[str] = set()
@@ -234,11 +258,20 @@ class DynamicExtractor:
                     timeout=5.0,
                 )
             except asyncio.TimeoutError:
+                # Cleanup window expired before every task ack'd the
+                # cancellation. Some Playwright futures complete after
+                # this point with an unretrieved exception, producing
+                # the `Future exception was never retrieved` warning.
+                # Attach a callback that consumes the exception when
+                # the future eventually settles, so the asyncio gc
+                # warning does not fire.
+                pending = [t for t in tasks if not t.done()]
+                for task in pending:
+                    task.add_done_callback(consume_orphan_exception)
                 log.debug(
                     "dynamic: cleanup gather timed out for %s, "
                     "abandoning %d tasks",
-                    job.domain,
-                    sum(1 for t in tasks if not t.done()),
+                    job.domain, len(pending),
                 )
         return results
 

@@ -34,6 +34,36 @@ LISTING_FIELDS: tuple[str, ...] = (
 
 ERROR_FIELDS: tuple[str, ...] = ("domain", "status", "reason")
 
+# Path SEGMENTS that prove the source URL is a CMS / informational
+# page rather than a real property detail page. These pages routinely
+# carry a single euro amount (an agency fee, a tax illustration, a
+# headline) plus the agency name, and would otherwise pass the
+# field-count anchor in `Listing.is_publishable`. The guard is an
+# additional check on top of the existing rules; it never widens
+# acceptance, only narrows it.
+#
+# Stored as exact segment names (no leading or trailing slash) and
+# matched against the slash-split URL path so a substring like
+# `/biens/contactville/123` does not collide with the `contact`
+# segment. The match is case-insensitive at lookup time.
+_NON_LISTING_URL_SEGMENTS: frozenset[str] = frozenset({
+    "honoraires", "mentions", "mentions-legales",
+    "cookies", "privacy", "cgu", "cgv", "legal",
+    "contact", "equipe", "team",
+    "agences", "actualites",
+    "blog", "article", "articles", "news",
+    "page", "pages",
+})
+
+# Compound paths that can only be recognised by their multi-segment
+# shape. `/i/redac/...` is the agencemathieu.fr CMS internal-page
+# prefix. Each entry is matched as a substring of the full URL path
+# (already lower-cased) because the segment-by-segment check would
+# require either entry to be a single segment.
+_NON_LISTING_URL_COMPOUNDS: tuple[str, ...] = (
+    "/i/redac/",
+)
+
 DOMAIN_SUMMARY_FIELDS: tuple[str, ...] = (
     "domain",
     "status",
@@ -141,6 +171,21 @@ class Listing:
         """
         def _set(value: str) -> bool:
             return bool((value or "").strip())
+
+        # CMS / informational page guard: reject before counting
+        # informative fields so a page with a fee amount + agency
+        # metadata cannot leak through the price-anchor branch.
+        # Slash-bounded segment match for plain names; substring
+        # match for compound CMS-prefix shapes like `/i/redac/`.
+        url_path = (self.source_url or "").lower().split("?", 1)[0]
+        if url_path:
+            for compound in _NON_LISTING_URL_COMPOUNDS:
+                if compound in url_path:
+                    return False
+            segments = [seg for seg in url_path.split("/") if seg]
+            for segment in segments:
+                if segment in _NON_LISTING_URL_SEGMENTS:
+                    return False
 
         informative = (
             self.price, self.location, self.surface_area,
