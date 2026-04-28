@@ -97,10 +97,15 @@ class Listing:
     def is_publishable(self) -> bool:
         """A listing qualifies when it carries enough listing-shaped signal.
 
-        Two conditions must both hold:
+        All three conditions must hold:
             1. At least two of the six informative fields are filled.
-            2. At least one of the *structural anchors* is filled:
-               price, surface_area, or reference_id.
+            2. EITHER price or reference_id is filled (the two strong
+               anchors that hub / template pages cannot fake), OR
+               surface_area AND at least one of
+               {rooms, location, property_type} are filled.
+            3. Trivially-empty informative fields are not counted in
+               the filled tally (whitespace-only values are treated
+               as absent).
 
         Informative fields are the six the brief uses to describe a
         property:
@@ -111,25 +116,36 @@ class Listing:
         propagates from the input CSV and would otherwise let any
         parsed page through.
 
-        The structural-anchor requirement protects the output CSV from
-        hub / contact / template pages whose only filled fields are
-        `location` (from the agency-csv fallback or breadcrumb) and
-        `property_type` (from a stray title-word scan). Real listings
-        always carry at least one of the three anchors.
+        Why surface_area alone is not enough: agency listing-index /
+        pagination templates render the most recent listing's surface
+        on the index page itself. A page that only produces
+        surface_area is therefore likely an index ghost, not a real
+        detail page. Requiring a companion descriptive field rejects
+        the ghost while preserving every real detail page (real
+        listings always set surface + at least one of rooms /
+        location / property_type).
         """
+        def _set(value: str) -> bool:
+            return bool((value or "").strip())
+
         informative = (
-            self.price,
-            self.location,
-            self.surface_area,
-            self.rooms,
-            self.reference_id,
-            self.property_type,
+            self.price, self.location, self.surface_area,
+            self.rooms, self.reference_id, self.property_type,
         )
-        filled = sum(1 for value in informative if (value or "").strip())
-        if filled < 2:
+        if sum(1 for v in informative if _set(v)) < 2:
             return False
-        anchors = (self.price, self.surface_area, self.reference_id)
-        return any((value or "").strip() for value in anchors)
+
+        # Strong anchors: price or reference_id alone is sufficient.
+        if _set(self.price) or _set(self.reference_id):
+            return True
+
+        # Surface-as-anchor only when paired with another descriptor.
+        if _set(self.surface_area) and any(
+            _set(v) for v in (self.rooms, self.location, self.property_type)
+        ):
+            return True
+
+        return False
 
 
 @dataclass(slots=True)

@@ -5,14 +5,14 @@ Real estate sites use very different conventions, so we look in:
     2. Visible labels (`Réf.\u00a0XYZ123`, `Reference: XYZ123`).
     3. URL slug heuristics (final path segment, comma-suffix, `-vp123`).
 
-Guards:
-    * Labels accept only identifier-shaped tokens: must contain a
-      digit, mixed case, or an internal separator. Bare lower-case
-      words (`aire`, `rue`, `page`) are rejected.
-    * Junk tokens cover the full nav/category vocabulary observed
-      across the input domains so hub-root slugs cannot leak through.
-    * Slug fallback rejects slugs that look like nav roots (short,
-      pure-alpha, lower-case).
+Guards (Round 2):
+    * Labels accept only identifier-shaped tokens.
+    * Junk tokens cover the full nav/category vocabulary.
+    * Slug fallback enforces a hyphen budget (<= 3) and a length
+      ceiling (<= 30 chars). A real reference is short.
+    * Slug must contain at least one digit OR start with an upper-case
+      acronym; pure lower-case hyphenated phrases (blog / info pages)
+      are rejected.
 """
 from __future__ import annotations
 
@@ -47,6 +47,17 @@ _JUNK_TOKENS = (
     "plan-du-site", "sitemap", "newsletter",
     "recrutement", "emploi", "carriere",
     "accueil", "home", "about", "a-propos",
+    # Round 2 additions
+    "accession", "personnaliser", "copropriete",
+    "bailleurs", "vendeurs", "acquereurs", "acheteurs",
+    "mandataire", "locataires",
+    "mes-biens", "mes-alertes", "mes-favoris",
+    "mon-compte", "mon-espace", "espace-client",
+    "financement", "simulateur", "simulation", "taux",
+    "reglementation", "environnementale",
+    "d-architecture", "hqe", "habitat-durable",
+    "choisir", "realiser", "reception",
+    "parrainage", "taxe", "vendre",
 )
 
 _VP_VM = re.compile(r"\b([A-Z]{1,3}\d{3,})\b")
@@ -60,6 +71,14 @@ _IDENTIFIER_SHAPE = re.compile(
 # A slug that looks like a nav root: short and purely lower-case alpha.
 _NAV_ROOT = re.compile(r"^[a-z]{1,5}$")
 
+# Slug shape constraints for the URL fallback.
+_MAX_SLUG_HYPHENS = 3
+_MAX_SLUG_LENGTH = 30
+
+# Pre-compiled checks for slug acceptability.
+_HAS_DIGIT = re.compile(r"\d")
+_LEADING_ACRONYM = re.compile(r"^[A-Z]{2,}[\-_/0-9]")
+
 
 def _is_junk(value: str) -> bool:
     lowered = (value or "").lower()
@@ -70,6 +89,25 @@ def _is_identifier_shaped(value: str) -> bool:
     if not value or len(value) < 3:
         return False
     return bool(_IDENTIFIER_SHAPE.match(value))
+
+
+def _slug_passes_shape(slug: str) -> bool:
+    """True if `slug` looks like a real listing reference.
+
+    Required:
+        - length <= _MAX_SLUG_LENGTH
+        - at most _MAX_SLUG_HYPHENS hyphens
+        - contains a digit OR begins with a 2+ char upper-case acronym
+    """
+    if not slug or len(slug) > _MAX_SLUG_LENGTH:
+        return False
+    if slug.count("-") > _MAX_SLUG_HYPHENS:
+        return False
+    if _HAS_DIGIT.search(slug):
+        return True
+    if _LEADING_ACRONYM.match(slug):
+        return True
+    return False
 
 
 def _from_slug(url: str) -> str:
@@ -86,11 +124,12 @@ def _from_slug(url: str) -> str:
         return ""
     if _is_junk(last):
         return ""
-    # Strip a trailing extension before shape-checking.
     stem = last.rsplit(".", 1)[0] if "." in last else last
     if _NAV_ROOT.match(stem):
         return ""
     if not _is_identifier_shaped(stem):
+        return ""
+    if not _slug_passes_shape(stem):
         return ""
     return last
 
@@ -102,6 +141,12 @@ def _accept_label(value: str) -> str:
     if _is_junk(candidate):
         return ""
     if not _is_identifier_shaped(candidate):
+        return ""
+    # The label path is deliberately more permissive than the slug
+    # path because the literal "Réf." / "Ref:" prefix is itself
+    # strong evidence; we still apply the digit-or-acronym shape so
+    # "id : immobilier" cannot match.
+    if not _slug_passes_shape(candidate):
         return ""
     return candidate
 

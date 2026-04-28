@@ -91,7 +91,19 @@ _T_NOTATION = re.compile(r"\bt\d\b", re.IGNORECASE)
 _HUB_REJECTION_REASONS: frozenset[str] = frozenset({
     "hub_path",
     "hub_pattern",
+    "pagination_index",
 })
+
+# A small bare integer at the end of a path is a pagination index,
+# not a property reference. Real reference ids are >= 4 digits on the
+# CMSes we observe.
+_PAGINATION_TAIL = re.compile(r"^\d{1,3}$")
+# Reference-shaped patterns that legitimately end with digits and must
+# NOT be misclassified as pagination.
+_REFERENCE_TAIL_HINTS = re.compile(
+    r"(?:-vp\d+|-vm\d+|,[A-Z]{1,3}\d+|/\d{4,}|ref-?\d+)\s*$",
+    re.IGNORECASE,
+)
 
 
 class SeedKind(str, Enum):
@@ -151,6 +163,18 @@ def classify_url(url: str) -> UrlClassification:
         return UrlClassification(-10, "hub_path")
     if _HUB_PATTERNS.search(full):
         return UrlClassification(-10, "hub_pattern")
+
+    # Single-digit (or 2-3 digit) pagination tails like `/vente/1`,
+    # `/location/1`, `/vente-pro/.../appartement/1`. The reference-shape
+    # check protects legitimate reference-based URLs that happen to
+    # end in digits.
+    segments_for_pagination = [seg for seg in normalised.split("/") if seg]
+    if (
+        segments_for_pagination
+        and _PAGINATION_TAIL.match(segments_for_pagination[-1])
+        and not _REFERENCE_TAIL_HINTS.search(normalised)
+    ):
+        return UrlClassification(-10, "pagination_index")
 
     score = 0
     reason_bits: list[str] = []
