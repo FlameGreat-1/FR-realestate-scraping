@@ -36,6 +36,16 @@ class Family:
     listing_url_patterns: tuple[Pattern[str], ...] = field(default_factory=tuple)
     requires_dynamic: bool = False
     selectors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # Paths on the FRANCHISE ROOT domain that list every branch
+    # sub-domain (`bordeaux.<franchise>.com`, ...). When the homepage
+    # of the root domain returns zero detail candidates, the
+    # discovery component fans out across these paths to recover
+    # the branch sub-domains that actually carry listings. Only set
+    # for franchises whose root domain is a national hub; CMS
+    # families (Apimo, Hektor, ...) leave this empty because their
+    # agencies live on independent registrable domains, not
+    # sub-domains of a shared root.
+    agency_index_paths: tuple[str, ...] = field(default_factory=tuple)
 
     def matches(self, signals: FamilySignals) -> bool:
         for pattern in self.host_patterns:

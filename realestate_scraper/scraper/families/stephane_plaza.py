@@ -22,6 +22,7 @@ STEPHANE_PLAZA = Family(
     selectors={
         "price": (".bien-prix", ".price", "[itemprop='price']"),
     },
+    agency_index_paths=("/agences/", "/nos-agences/"),
 )
 
 get_registry().register(STEPHANE_PLAZA)

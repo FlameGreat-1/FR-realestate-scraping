@@ -19,6 +19,7 @@ ORPI = Family(
     # Detail pages serve usable static HTML. Pipeline escalates to
     # dynamic on zero-listing static, so coverage is preserved.
     requires_dynamic=False,
+    agency_index_paths=("/agences/",),
 )
 
 get_registry().register(ORPI)

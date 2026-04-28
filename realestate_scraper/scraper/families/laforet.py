@@ -20,6 +20,7 @@ LAFORET = Family(
     # screen is JS-heavy. The pipeline still escalates to Playwright if
     # the static path returns zero listings, so we lose no coverage.
     requires_dynamic=False,
+    agency_index_paths=("/agences-immobilieres/",),
 )
 
 get_registry().register(LAFORET)

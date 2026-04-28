@@ -25,6 +25,7 @@ NESTENN = Family(
         "price": (".price", "[itemprop='price']", ".property-price"),
         "reference": (".reference", "[data-reference]"),
     },
+    agency_index_paths=("/agences/",),
 )
 
 get_registry().register(NESTENN)
