@@ -8,6 +8,17 @@ Order of confidence:
 
 We never accept asset filenames, `noreply@`, or known placeholders;
 the `_is_acceptable` filter is the single point of truth for that.
+
+Robustness:
+    Every regex sweep runs against a SIZE-CAPPED slice of the source
+    text/HTML. Even a perfectly engineered regex should not run
+    unbounded over arbitrary network input - the caps are the
+    defence-in-depth backstop against any future pathological input.
+    The obfuscated-email pattern is also engineered with
+    word-boundary anchors and bounded character-class quantifiers
+    so it cannot catastrophically backtrack on long French body
+    text containing words like `attribute`, `attestation`,
+    `attendre`, `dotation`, etc.
 """
 from __future__ import annotations
 
@@ -18,16 +29,27 @@ from selectolax.parser import HTMLParser
 
 from ..models import PageContext, ResolverResult
 
-_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# Hard caps on regex input size. Real contact information lives in
+# contact / agent blocks near the top of the page; scanning MBs of
+# below-the-fold text is wasted work and a backtracking risk.
+_MAX_OBFUSCATED_TEXT_BYTES = 32_000
+_MAX_PLAINTEXT_HTML_BYTES = 256_000
+
+_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,24}")
 _BAD_FRAGMENTS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
     "x320", "x640", "x1024", "sentry", "example.com",
 )
 
-# `name [at] domain [dot] tld` - both markers required, bounded TLD.
+# `name [at] domain [dot] tld` - both markers required, BOTH literals
+# anchored with `\b` on both sides so they only match standalone
+# tokens (never substrings inside `attribute`, `attestation`,
+# `attendre`, `dotation`, etc.). Local-part and domain bounded to
+# RFC 5321 maxima so the engine cannot backtrack across thousands of
+# possible lengths on each false start.
 _OBFUSCATED = re.compile(
-    r"([A-Za-z0-9._%+\-]+)\s*[\[\(]\s*at\s*[\]\)]\s*"
-    r"([A-Za-z0-9.\-]+?)\s*[\[\(]\s*dot\s*[\]\)]\s*"
+    r"([A-Za-z0-9._%+\-]{1,64})\s*[\[\(]\s*\bat\b\s*[\]\)]\s*"
+    r"([A-Za-z0-9.\-]{1,64})\s*[\[\(]\s*\bdot\b\s*[\]\)]\s*"
     r"([A-Za-z]{2,8})",
     re.IGNORECASE,
 )
@@ -112,7 +134,11 @@ def _from_mailto(parser: HTMLParser) -> str:
 def _from_obfuscated(text: str) -> str:
     if not text:
         return ""
-    for match in _OBFUSCATED.finditer(text):
+    # Hard input cap: real contact info lives near the top of the
+    # page, never thousands of bytes deep into body text. The cap is
+    # also a backstop against any pathological future input.
+    capped = text[:_MAX_OBFUSCATED_TEXT_BYTES]
+    for match in _OBFUSCATED.finditer(capped):
         local, domain, tld = match.group(1), match.group(2), match.group(3)
         candidate = f"{local}@{domain}.{tld}".lower()
         if _is_acceptable(candidate):
@@ -146,7 +172,8 @@ class EmailResolver:
             if value:
                 return ResolverResult(value, 0.7, "obfuscated")
 
-        for match in _EMAIL.finditer(ctx.html):
+        # Plaintext sweep, also size-capped.
+        for match in _EMAIL.finditer(ctx.html[:_MAX_PLAINTEXT_HTML_BYTES]):
             candidate = match.group(0)
             if _is_acceptable(candidate):
                 return ResolverResult(candidate, 0.6, "regex")
