@@ -33,9 +33,42 @@ from .headers import (
 )
 from .utils.ratelimit import HostLimiter
 from .utils.retry import with_retry
-from .utils.url import probe_variants
+from .utils.url import parse_host, probe_variants
 
 log = logging.getLogger(__name__)
+
+
+# Per-host fast-fail threshold: after this many consecutive
+# 401/403/429 responses, every subsequent fetch on the same host
+# returns immediately with a synthetic 403 outcome. Prevents the
+# static path from spending the per-domain budget on a host that
+# is hard-blocking httpx fetches. The dynamic extractor's Playwright
+# escalation path is unaffected because it does not go through this
+# fetcher for its detail render.
+_HOST_BLOCK_THRESHOLD: int = 3
+
+
+class _HostBlockTracker:
+    """Tracks consecutive 401/403/429 per host.
+
+    No locking: dict mutations are atomic on the single-threaded
+    event loop. Counters reset on any successful response.
+    """
+
+    __slots__ = ("_counts",)
+
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+
+    def is_blocked(self, host: str) -> bool:
+        return self._counts.get(host, 0) >= _HOST_BLOCK_THRESHOLD
+
+    def record_block(self, host: str) -> None:
+        self._counts[host] = self._counts.get(host, 0) + 1
+
+    def record_ok(self, host: str) -> None:
+        if host in self._counts:
+            self._counts[host] = 0
 
 _NON_HTML_PREFIXES = (
     "image/", "video/", "audio/", "font/", "application/pdf",
@@ -111,6 +144,7 @@ class HttpFetcher:
         self._probe_timeout = probe_timeout
         self._fetch_timeout = fetch_timeout
         self._accept_language = accept_language
+        self._block_tracker = _HostBlockTracker()
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -207,15 +241,27 @@ class HttpFetcher:
         """GET `url` with transient-error retries and optional UA rotation.
 
         On a 401/403/429 response we retry exactly once with a rotated
-        UA profile before returning the (still-blocked) outcome. The
-        higher-level pipeline decides whether to escalate to dynamic
-        rendering after that.
+        UA profile before returning the (still-blocked) outcome.
+
+        Per-host fast-fail: once a host has produced
+        _HOST_BLOCK_THRESHOLD consecutive 401/403/429 responses, every
+        subsequent fetch on that host returns a synthetic 403 without
+        touching the network. This prevents the static path from
+        wasting the per-domain wall-clock on hosts that have made it
+        clear they are not going to answer httpx.
         """
         if not url:
             return FetchOutcome(
                 url=url, status=None, text="",
                 final_url=url, content_type="",
                 error=ValueError("empty url"),
+            )
+
+        host = parse_host(url)
+        if host and self._block_tracker.is_blocked(host):
+            return FetchOutcome(
+                url=url, status=403, text="",
+                final_url=url, content_type="",
             )
 
         outcome = await self._fetch_with_headers(
@@ -233,16 +279,24 @@ class HttpFetcher:
                 headers=rotated,
                 timeout=timeout,
             )
-            # Prefer the retry only if it produced a usable response;
-            # otherwise return the original block so the pipeline still
-            # classifies it correctly.
             if retried.ok:
+                if host:
+                    self._block_tracker.record_ok(host)
                 return retried
             if (
                 retried.status is not None
                 and retried.status not in _BLOCK_STATUSES
             ):
+                if host:
+                    self._block_tracker.record_ok(host)
                 return retried
+            outcome = retried
+
+        if host:
+            if outcome.ok:
+                self._block_tracker.record_ok(host)
+            elif outcome.status in _BLOCK_STATUSES:
+                self._block_tracker.record_block(host)
         return outcome
 
     async def _fetch_with_headers(

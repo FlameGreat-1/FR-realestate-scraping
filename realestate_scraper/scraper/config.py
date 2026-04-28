@@ -93,13 +93,16 @@ class Settings(BaseSettings):
     accept_language: str = Field(default="fr-FR,fr;q=0.9,en;q=0.7")
     enable_playwright: bool = Field(default=True)
     # Geocoding fills `coordinates` for listings whose pages did not
-    # ship lat/lng in any in-page form. Architecturally the geocoder
-    # runs as a SINGLE post-pass after every domain has finished
-    # scraping, NEVER on the per-domain hot path - that's the only
-    # safe shape under the Nominatim 1-req/s policy at high domain
-    # concurrency. At 55k+ scale the operator can flip this off via
-    # the `ENABLE_GEOCODING` environment variable.
-    enable_geocoding: bool = Field(default=True)
+    # ship lat/lng in any in-page form. The CoordinatesResolver still
+    # extracts coordinates from json-ld / meta / data-attrs / leaflet /
+    # mapbox / map iframes - geocoding only handles the residual case
+    # of pages with no embedded coordinates at all.
+    #
+    # Default OFF because the post-pass runs serially through
+    # Nominatim's 1-req/s policy and at 55k+ scale dominates total
+    # runtime. Operators who need geocoded output flip this on
+    # explicitly via the ENABLE_GEOCODING environment variable.
+    enable_geocoding: bool = Field(default=False)
     geocoder_user_agent: str = Field(default="realestate_scraper/1.0")
     geocoder_timeout: float = Field(default=3.0, gt=0)
     # Hard wall-clock cap on the geocoder POST-PASS (after every
