@@ -1,18 +1,38 @@
-"""Dynamic (Playwright) listing extractor.
+"""Dynamic (Playwright-assisted) listing extractor.
 
 Used for sites the fingerprint flagged as `Strategy.DYNAMIC` or that
 blocked the static fetcher. Reuses the resolver pipeline so the output
 contract is identical to the static path.
+
+Design:
+    The expensive part of dynamic extraction is *navigation*, not
+    parsing. So we minimise it:
+
+    1. Use Playwright to render the homepage and harvest anchors.
+       This is the only step that genuinely needs JS or Cloudflare
+       cookie negotiation.
+    2. Fetch every detail URL via the shared HttpFetcher (httpx) with
+       the rotated UA + client-hint profile. Most WAF-protected sites
+       only challenge the homepage; detail pages serve clean HTML to
+       a request that already presents a coherent fingerprint.
+    3. If a single detail URL returns 401/403/429 via httpx, escalate
+       only that URL to Playwright. The escalation is bounded by the
+       browser pool semaphore and the per-page navigation timeout, so
+       it cannot dominate the runtime.
+
+This keeps the Playwright cost proportional to the *blocked subset*
+of a domain instead of the full candidate set.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Iterable
+from typing import Iterable, Optional
 
 from ..browser_pool import BrowserPool
 from ..config import Settings
 from ..fingerprint import Fingerprint
+from ..http_client import FetchOutcome, HttpFetcher
 from ..listing_filter import classify_url
 from ..models import DomainJob, Listing
 from ..seed_discovery import _extract_anchor_hrefs
@@ -27,6 +47,7 @@ from .pipeline_extract import build_listing, parse_page
 log = logging.getLogger(__name__)
 
 _DYNAMIC_LIMIT_DIVISOR = 3
+_BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 429})
 
 
 def _rank_and_limit(
@@ -57,11 +78,18 @@ def _rank_and_limit(
 
 
 class DynamicExtractor:
-    """Pulls listings using a headless Chromium instance."""
+    """Pulls listings using a headless Chromium instance for discovery only."""
 
-    def __init__(self, settings: Settings, browser_pool: BrowserPool) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        browser_pool: BrowserPool,
+        fetcher: HttpFetcher,
+    ) -> None:
         self._settings = settings
         self._pool = browser_pool
+        self._fetcher = fetcher
+        self._listing_sem = asyncio.Semaphore(settings.listing_concurrency)
 
     @property
     def is_available(self) -> bool:
@@ -86,21 +114,10 @@ class DynamicExtractor:
 
         results: list[Listing] = []
         seen_keys: set[str] = set()
-        nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
 
-        async def _process(url: str) -> Listing | None:
-            try:
-                async with self._pool.page(target_url=url) as page:
-                    response = await page.goto(
-                        url, wait_until="domcontentloaded", timeout=nav_timeout_ms
-                    )
-                    if response is None or response.status >= 400:
-                        return None
-                    html = await page.content()
-                    if not html:
-                        return None
-            except Exception as exc:  # noqa: BLE001
-                log.debug("dynamic fetch %s failed: %s", url, exc)
+        async def _process(url: str) -> Optional[Listing]:
+            html = await self._get_html(url)
+            if not html:
                 return None
             ctx = parse_page(url, html, domain_job=job)
             listing = build_listing(ctx)
@@ -124,12 +141,41 @@ class DynamicExtractor:
             results.append(listing)
         return results
 
+    async def _get_html(self, url: str) -> str:
+        """Try httpx first; escalate to Playwright only on hard blocks."""
+        async with self._listing_sem:
+            outcome: FetchOutcome = await self._fetcher.fetch(url)
+        if outcome.ok and outcome.is_html_like and outcome.text:
+            return outcome.text
+        if outcome.status is None or outcome.status in _BLOCK_STATUSES:
+            html = await self._render_with_playwright(url)
+            if html:
+                return html
+        return ""
+
+    async def _render_with_playwright(self, url: str) -> str:
+        """Last-resort per-page Playwright render. Errors swallowed by design."""
+        nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
+        try:
+            async with self._pool.page(target_url=url) as page:
+                response = await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=nav_timeout_ms,
+                )
+                if response is None or response.status >= 400:
+                    return ""
+                return await page.content() or ""
+        except Exception as exc:  # noqa: BLE001
+            log.debug("dynamic page render %s failed: %s", url, exc)
+            return ""
+
     async def _discover_candidates(
         self,
         job: DomainJob,
         fingerprint: Fingerprint,
     ) -> list[str]:
-        """Use the browser to render the homepage and harvest links."""
+        """Render the homepage in a browser, then harvest its anchors."""
         urls: list[str] = []
         nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
         try:
@@ -141,12 +187,22 @@ class DynamicExtractor:
                 )
                 if response is not None and response.status < 400:
                     html = await page.content()
+                    base = str(page.url) or job.url
                     for href in _extract_anchor_hrefs(html or ""):
-                        absolute = join_url(job.url, href)
+                        absolute = join_url(base, href)
                         if absolute.startswith(("http://", "https://")):
                             urls.append(absolute)
         except Exception as exc:  # noqa: BLE001
             log.debug("dynamic homepage harvest %s failed: %s", job.url, exc)
+
+        # If Playwright is unavailable or the rendered homepage was
+        # empty, fall back to whatever the fingerprint already captured.
+        if not urls and fingerprint.homepage_html:
+            base = fingerprint.final_url or job.url
+            for href in _extract_anchor_hrefs(fingerprint.homepage_html):
+                absolute = join_url(base, href)
+                if absolute.startswith(("http://", "https://")):
+                    urls.append(absolute)
 
         limit = max(
             10,

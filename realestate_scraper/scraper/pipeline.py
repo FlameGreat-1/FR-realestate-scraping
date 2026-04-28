@@ -80,7 +80,7 @@ class Pipeline:
             browser_pool = BrowserPool(self._settings)
             try:
                 static = StaticExtractor(self._settings, fetcher)
-                dynamic = DynamicExtractor(self._settings, browser_pool)
+                dynamic = DynamicExtractor(self._settings, browser_pool, fetcher)
 
                 async def _producer() -> None:
                     for job in jobs:
