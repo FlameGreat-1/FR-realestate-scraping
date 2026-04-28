@@ -48,6 +48,32 @@ class AsyncGeocoder:
     def enabled(self) -> bool:
         return self._enabled and self._geocoder is not None
 
+    def lookup_cached(self, location: str) -> str:
+        """Synchronous, lock-free cache read.
+
+        Returns the pre-known value when `location` has been resolved
+        in a prior call (this run or a persisted previous run). When
+        the cache has stored an empty string for `location` (a known
+        miss) the empty string is returned, which prevents repeated
+        misses from re-issuing Nominatim calls.
+
+        Returns an empty string when the cache has never seen the key;
+        the caller decides whether to escalate to a network lookup.
+
+        This method never blocks on the rate-limit lock and never
+        issues a network request. Safe to invoke concurrently from
+        any number of coroutines.
+        """
+        if not self.enabled or not location or len(location) < 3:
+            return ""
+        return self._cache.get(location.strip().lower(), "")
+
+    def is_cached(self, location: str) -> bool:
+        """True when the cache has an entry for `location` (hit or known miss)."""
+        if not self.enabled or not location or len(location) < 3:
+            return False
+        return location.strip().lower() in self._cache
+
     def _load_cache(self) -> None:
         path = self._cache_path
         if path is None or not path.exists():

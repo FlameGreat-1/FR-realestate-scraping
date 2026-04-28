@@ -9,11 +9,14 @@ Signals checked, top to bottom:
     2. OpenGraph / place / geo `<meta>` tags.
     3. `data-lat*` / `data-lng*` / `data-latitude` / `data-longitude`
        attributes on any element. Stable across CMS template churn.
-    4. Leaflet conventions: `L.marker([lat, lng])`, `L.latLng(lat, lng)`,
+    4. Combined `data-coords` / `data-position` / `data-latlng`
+       attributes (single-attribute lat,lng pair).
+    5. Leaflet conventions: `L.marker([lat, lng])`, `L.latLng(lat, lng)`,
        `map.setView([lat, lng], zoom)`.
-    5. Mapbox conventions: `center: [lng, lat]` (note: longitude first).
-    6. Generic inline `lat=...`, `latitude=...` keys.
-    7. Google Maps iframe `src` queries.
+    6. Mapbox conventions: `center: [lng, lat]` (note: longitude first).
+    7. Generic inline `lat=...`, `latitude=...` keys.
+    8. Google Maps anchor `href` queries (a[href] in addition to iframe).
+    9. Google Maps iframe `src` queries.
 
 Every candidate goes through `_format_pair` which validates the
 numeric range, so junk strings (template placeholders, swapped axes
@@ -50,12 +53,21 @@ _MAPBOX_CENTER = re.compile(
 _LL_QUERY = re.compile(rf"[?&]ll=({_FLOAT}),({_FLOAT})")
 _Q_QUERY = re.compile(rf"[?&]q=({_FLOAT}),({_FLOAT})")
 _AT_PATTERN = re.compile(rf"/@({_FLOAT}),({_FLOAT})")
+# A combined `lat,lng` value used in single-attribute shapes
+# (`data-coords="43.57, 3.87"`, `data-position="43.57,3.87"`).
+_COMBINED_PAIR = re.compile(
+    rf"^\s*({_FLOAT})\s*,\s*({_FLOAT})\s*$"
+)
 
 _DATA_LNG_ATTRS = (
     "data-lng", "data-lon", "data-long", "data-longitude",
 )
 _DATA_LAT_ATTRS = (
     "data-lat", "data-latitude",
+)
+_DATA_COMBINED_ATTRS = (
+    "data-coords", "data-coord", "data-position",
+    "data-latlng", "data-latlong", "data-geo",
 )
 
 _META_LAT = (
@@ -151,21 +163,67 @@ def _from_data_attributes(parser: HTMLParser) -> str:
     return ""
 
 
+def _from_combined_attribute(parser: HTMLParser) -> str:
+    """Read single-attribute `lat,lng` pairs (data-coords / data-position)."""
+    try:
+        candidates = parser.css(
+            ", ".join(f"[{name}]" for name in _DATA_COMBINED_ATTRS)
+        )
+    except Exception:
+        return ""
+    for node in candidates:
+        attrs = node.attributes
+        for name in _DATA_COMBINED_ATTRS:
+            raw = attrs.get(name)
+            if not raw:
+                continue
+            match = _COMBINED_PAIR.match(raw.strip())
+            if not match:
+                continue
+            result = _format_pair(match.group(1), match.group(2))
+            if result:
+                return result
+    return ""
+
+
+def _scan_url_for_pair(href: str) -> str:
+    if not href:
+        return ""
+    if "google" not in href and "maps" not in href and "openstreetmap" not in href:
+        return ""
+    for pattern in (_LL_QUERY, _Q_QUERY, _AT_PATTERN):
+        match = pattern.search(href)
+        if match:
+            result = _format_pair(match.group(1), match.group(2))
+            if result:
+                return result
+    return ""
+
+
+def _from_map_anchors(parser: HTMLParser) -> str:
+    """Extract coordinates from external map anchors (a[href])."""
+    try:
+        nodes = parser.css("a[href]")
+    except Exception:
+        return ""
+    for node in nodes:
+        href = (node.attributes.get("href") or "").strip()
+        result = _scan_url_for_pair(href)
+        if result:
+            return result
+    return ""
+
+
 def _from_iframes(parser: HTMLParser) -> str:
     try:
         nodes = parser.css("iframe[src]")
     except Exception:
         return ""
     for node in nodes:
-        src = node.attributes.get("src", "") or ""
-        if "google" not in src and "maps" not in src:
-            continue
-        for pattern in (_LL_QUERY, _Q_QUERY, _AT_PATTERN):
-            match = pattern.search(src)
-            if match:
-                result = _format_pair(match.group(1), match.group(2))
-                if result:
-                    return result
+        src = (node.attributes.get("src") or "").strip()
+        result = _scan_url_for_pair(src)
+        if result:
+            return result
     return ""
 
 
@@ -222,11 +280,19 @@ class CoordinatesResolver:
             if value:
                 return ResolverResult(value, 0.85, "data_attr")
 
+            value = _from_combined_attribute(parser)
+            if value:
+                return ResolverResult(value, 0.83, "data_combined")
+
         value = _from_inline_js(ctx.html)
         if value:
             return ResolverResult(value, 0.75, "inline_js")
 
         if parser is not None:
+            value = _from_map_anchors(parser)
+            if value:
+                return ResolverResult(value, 0.72, "map_anchor")
+
             value = _from_iframes(parser)
             if value:
                 return ResolverResult(value, 0.7, "iframe")

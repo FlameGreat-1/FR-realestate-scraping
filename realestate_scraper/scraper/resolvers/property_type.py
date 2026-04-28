@@ -61,7 +61,19 @@ _PROPERTY_TYPES: tuple[tuple[str, int, tuple[str, ...]], ...] = (
 )
 
 # URL category segments observed on Apimo / Hektor / WP templates.
+# Order matters: first match wins, so the more specific `*-pro`
+# (commercial) segments are placed BEFORE their residential
+# counterparts to avoid misclassifying `vente-pro/.../bureaux/...`
+# as a residential listing.
 _URL_SEGMENT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # --- Commercial sub-tree (vente-pro / location-pro) ---
+    (re.compile(r"/(?:vente|location)s?-pro/[^/]*/bureaux\b", re.IGNORECASE), "bureau"),
+    (re.compile(r"/(?:vente|location)s?-pro/[^/]*/locaux\b", re.IGNORECASE), "local"),
+    (re.compile(r"/(?:vente|location)s?-pro/[^/]*/(?:entrepots?|commerces?|fonds-de-commerce)\b", re.IGNORECASE), "local commercial"),
+    (re.compile(r"/(?:vente|location)s?-pro/[^/]*/garages?\b", re.IGNORECASE), "garage"),
+    (re.compile(r"/(?:vente|location)s?-pro/[^/]*/parkings?\b", re.IGNORECASE), "parking"),
+    (re.compile(r"/(?:vente|location)s?-pro/[^/]*/immeubles?\b", re.IGNORECASE), "immeuble"),
+    # --- Residential category-anchored URL prefixes ---
     (re.compile(r"/ventes?-maisons?\b", re.IGNORECASE), "maison"),
     (re.compile(r"/ventes?-appartements?\b", re.IGNORECASE), "appartement"),
     (re.compile(r"/ventes?-villas?\b", re.IGNORECASE), "villa"),
@@ -74,12 +86,14 @@ _URL_SEGMENT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"/ventes?-parkings?\b", re.IGNORECASE), "parking"),
     (re.compile(r"/locations?-maisons?\b", re.IGNORECASE), "maison"),
     (re.compile(r"/locations?-appartements?\b", re.IGNORECASE), "appartement"),
+    # --- /<vente|location>/<commune>/<category>/ shape ---
     (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/maisons?(?:/|$)", re.IGNORECASE), "maison"),
     (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/appartements?(?:/|$)", re.IGNORECASE), "appartement"),
     (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/villas?(?:/|$)", re.IGNORECASE), "villa"),
     (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/terrains?(?:/|$)", re.IGNORECASE), "terrain"),
     (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/bureaux\b", re.IGNORECASE), "bureau"),
     (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/locaux\b", re.IGNORECASE), "local"),
+    (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/(?:entrepots?|commerces?|fonds-de-commerce)\b", re.IGNORECASE), "local commercial"),
     (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/garages?\b", re.IGNORECASE), "garage"),
     (re.compile(r"/(?:vente|location)/\d*-?[a-z\-]+/parkings?\b", re.IGNORECASE), "parking"),
 )
