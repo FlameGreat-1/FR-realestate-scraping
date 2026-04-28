@@ -92,12 +92,33 @@ def _read_errors(path: Path) -> list[tuple[str, str, str]]:
     return rows
 
 
+def _escape_cell(value: str) -> str:
+    """Make `value` safe to interpolate into a markdown table cell.
+
+    Replaces the column-separator character `|` with its escape, and
+    collapses every newline / carriage return / tab to a single space
+    so a multi-line value stays on one row. Trims surrounding
+    whitespace; idempotent for safe inputs.
+    """
+    if value is None:
+        return ""
+    text = str(value).replace("|", r"\|")
+    for ch in ("\r", "\n", "\t"):
+        text = text.replace(ch, " ")
+    while "  " in text:
+        text = text.replace("  ", " ")
+    return text.strip()
+
+
 def _format_table(rows: Iterable[tuple[str, ...]], headers: tuple[str, ...]) -> str:
     lines = [
-        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(_escape_cell(h) for h in headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
-    lines.extend("| " + " | ".join(row) + " |" for row in rows)
+    lines.extend(
+        "| " + " | ".join(_escape_cell(cell) for cell in row) + " |"
+        for row in rows
+    )
     return "\n".join(lines)
 
 
