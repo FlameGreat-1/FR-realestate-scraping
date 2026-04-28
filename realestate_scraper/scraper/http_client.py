@@ -47,6 +47,11 @@ log = logging.getLogger(__name__)
 # fetcher for its detail render.
 _HOST_BLOCK_THRESHOLD: int = 3
 
+# Hard cap on the plain-GET probe fall-through, in seconds. Range-
+# rejecting hosts answer in milliseconds; truly-unreachable hosts
+# would otherwise pay the full probe_timeout on every run.
+_PLAIN_PROBE_TIMEOUT_CAP: float = 3.0
+
 
 class _HostBlockTracker:
     """Tracks consecutive 401/403/429 per host.
@@ -253,14 +258,21 @@ class HttpFetcher:
         Used only when every Range probe variant returned None. Reuses
         the same per-host slot and header rotation, so we never
         bypass the limiter or anti-block layer.
+
+        The timeout is deliberately short (`_PLAIN_PROBE_TIMEOUT_CAP`,
+        3 s) rather than the full `probe_timeout`. Range-rejecting
+        hosts answer in milliseconds once the header is dropped, so
+        a long timeout only adds wall-clock cost on truly-unreachable
+        hosts that will never answer regardless of request shape.
         """
+        timeout = min(self._probe_timeout, _PLAIN_PROBE_TIMEOUT_CAP)
         headers = dict(self.headers_for(url))
         async with self._limiter.slot(url):
             try:
                 response = await self._client.request(
                     "GET",
                     url,
-                    timeout=self._probe_timeout,
+                    timeout=timeout,
                     headers=headers,
                 )
                 return response.status_code
