@@ -95,7 +95,12 @@ class Listing:
         return asdict(self)
 
     def is_publishable(self) -> bool:
-        """A listing qualifies when at least two informative fields are set.
+        """A listing qualifies when it carries enough listing-shaped signal.
+
+        Two conditions must both hold:
+            1. At least two of the six informative fields are filled.
+            2. At least one of the *structural anchors* is filled:
+               price, surface_area, or reference_id.
 
         Informative fields are the six the brief uses to describe a
         property:
@@ -105,6 +110,12 @@ class Listing:
         Agency/agent metadata is intentionally excluded because it
         propagates from the input CSV and would otherwise let any
         parsed page through.
+
+        The structural-anchor requirement protects the output CSV from
+        hub / contact / template pages whose only filled fields are
+        `location` (from the agency-csv fallback or breadcrumb) and
+        `property_type` (from a stray title-word scan). Real listings
+        always carry at least one of the three anchors.
         """
         informative = (
             self.price,
@@ -115,7 +126,10 @@ class Listing:
             self.property_type,
         )
         filled = sum(1 for value in informative if (value or "").strip())
-        return filled >= 2
+        if filled < 2:
+            return False
+        anchors = (self.price, self.surface_area, self.reference_id)
+        return any((value or "").strip() for value in anchors)
 
 
 @dataclass(slots=True)
