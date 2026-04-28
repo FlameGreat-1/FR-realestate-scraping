@@ -2,7 +2,10 @@
 
 A `Family` provides:
     * `matches(html, url, headers)` - cheap fingerprint detection.
-    * `listing_url_hints` - regex patterns that boost classifier scores.
+    * `listing_url_patterns` - regex patterns that boost classifier scores.
+    * `agency_index_paths` - franchise-only paths on the root domain that
+      list every branch sub-domain, used by the discovery component to
+      recover hubs whose root serves no detail pages.
     * `selectors` - optional CSS selectors used by the static extractor.
 
 Families never *replace* the generic resolvers; they only *augment*
@@ -32,10 +35,6 @@ class Family:
 
     name: str
     host_patterns: tuple[Pattern[str], ...] = field(default_factory=tuple)
-    html_markers: tuple[Pattern[str], ...] = field(default_factory=tuple)
-    listing_url_patterns: tuple[Pattern[str], ...] = field(default_factory=tuple)
-    requires_dynamic: bool = False
-    selectors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     # Paths on the FRANCHISE ROOT domain that list every branch
     # sub-domain (`bordeaux.<franchise>.com`, ...). When the homepage
     # of the root domain returns zero detail candidates, the
@@ -46,6 +45,10 @@ class Family:
     # agencies live on independent registrable domains, not
     # sub-domains of a shared root.
     agency_index_paths: tuple[str, ...] = field(default_factory=tuple)
+    html_markers: tuple[Pattern[str], ...] = field(default_factory=tuple)
+    listing_url_patterns: tuple[Pattern[str], ...] = field(default_factory=tuple)
+    requires_dynamic: bool = False
+    selectors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def matches(self, signals: FamilySignals) -> bool:
         for pattern in self.host_patterns:
