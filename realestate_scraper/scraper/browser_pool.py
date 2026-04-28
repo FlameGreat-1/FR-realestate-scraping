@@ -176,6 +176,7 @@ class BrowserPool:
         await self._semaphore.acquire()
         context = None
         page = None
+        context_healthy = True
         try:
             context = await self._acquire_context()
             profile = (
@@ -203,30 +204,62 @@ class BrowserPool:
             )
             yield page
         finally:
-            try:
-                if page is not None:
-                    await page.close()
-            except Exception:  # noqa: BLE001
-                pass
+            # Page close with a hard 3s timeout. A broken Playwright
+            # connection can hang page.close() indefinitely, which
+            # blocks the semaphore release and permanently reduces
+            # browser pool capacity.
+            if page is not None:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=3.0)
+                except Exception:  # noqa: BLE001
+                    # Page close failed or timed out. The context may
+                    # have corrupted state; mark it unhealthy so we
+                    # discard it instead of returning to the idle pool.
+                    context_healthy = False
             if context is not None:
-                self._release_context(context)
+                if context_healthy:
+                    self._release_context(context)
+                else:
+                    # Discard the corrupted context. A fresh one will
+                    # be built on next borrow. Remove from tracking
+                    # so close() doesn't double-close it.
+                    try:
+                        self._all_contexts.remove(context)
+                    except ValueError:
+                        pass
+                    try:
+                        await asyncio.wait_for(context.close(), timeout=3.0)
+                    except Exception:  # noqa: BLE001
+                        pass
             self._semaphore.release()
 
 
 async def _route_handler(route: Any) -> None:
-    """Block heavy / tracking resources to keep dynamic runs fast."""
-    request = route.request
-    if request.resource_type in _BLOCKED_RESOURCE_TYPES:
-        try:
-            await route.abort()
-        except Exception:  # noqa: BLE001
-            await route.continue_()
-        return
-    url = request.url.lower()
-    if any(fragment in url for fragment in _BLOCKED_URL_FRAGMENTS):
-        try:
-            await route.abort()
-        except Exception:  # noqa: BLE001
-            await route.continue_()
-        return
-    await route.continue_()
+    """Block heavy / tracking resources to keep dynamic runs fast.
+
+    Every route action (abort / continue) is wrapped in try/except
+    because the browser context or page can be closed at any moment
+    by domain-level timeout cancellation. An unhandled exception here
+    cascades as a TargetClosedError / "Connection closed while reading
+    from the driver" that poisons the entire browser process.
+    """
+    try:
+        request = route.request
+        if request.resource_type in _BLOCKED_RESOURCE_TYPES:
+            try:
+                await route.abort()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        url = request.url.lower()
+        if any(fragment in url for fragment in _BLOCKED_URL_FRAGMENTS):
+            try:
+                await route.abort()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        await route.continue_()
+    except Exception:  # noqa: BLE001
+        # Context/page was closed during cancellation. Swallow silently
+        # to prevent the error cascade seen in the run logs.
+        pass

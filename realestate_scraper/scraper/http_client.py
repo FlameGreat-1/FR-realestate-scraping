@@ -16,6 +16,7 @@ Anti-block layer:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -142,14 +143,34 @@ class HttpFetcher:
         )
 
     async def probe(self, url: str) -> ProbeResult:
-        """Reachability probe with www/scheme variant fallback."""
+        """Reachability probe with www/scheme variant fallback.
+
+        All variants are probed concurrently; the first successful
+        response wins. This reduces worst-case probe time from
+        N * timeout to max(timeout) for unreachable hosts.
+        """
         if not url:
             return ProbeResult(status_code=None, final_url=url)
 
-        for candidate in probe_variants(url):
+        variants = probe_variants(url)
+        if not variants:
+            return ProbeResult(status_code=None, final_url=url)
+
+        async def _try(candidate: str) -> tuple[str, Optional[int]]:
             status = await self._probe_single(candidate)
-            if status is not None:
-                return ProbeResult(status_code=status, final_url=candidate)
+            return candidate, status
+
+        tasks = [asyncio.create_task(_try(v)) for v in variants]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                candidate, status = await coro
+                if status is not None:
+                    return ProbeResult(status_code=status, final_url=candidate)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         return ProbeResult(status_code=None, final_url=url)
 
     async def _probe_single(self, url: str) -> Optional[int]:
@@ -276,13 +297,20 @@ async def open_fetcher(settings: Settings) -> AsyncIterator[HttpFetcher]:
     limits = httpx.Limits(
         max_keepalive_connections=settings.domain_concurrency * 4,
         max_connections=settings.domain_concurrency * 8,
-        keepalive_expiry=30.0,
+        # Shorter keepalive: idle connections from processed domains
+        # hold pool slots that active domains need. At scale, 30s
+        # keepalive on hundreds of hosts wastes connection capacity.
+        keepalive_expiry=15.0,
     )
     timeout = httpx.Timeout(
-        connect=min(settings.http_probe_timeout, 8.0),
+        connect=min(settings.http_probe_timeout, 6.0),
         read=settings.http_fetch_timeout,
         write=settings.http_fetch_timeout,
-        pool=settings.http_fetch_timeout,
+        # Pool timeout is deliberately shorter than fetch timeout.
+        # A request that cannot acquire a connection within 5s should
+        # fail fast so the per-listing wall-clock guard can drop it
+        # and move on, rather than blocking silently in the pool queue.
+        pool=5.0,
     )
     transport = httpx.AsyncHTTPTransport(
         retries=0,

@@ -140,11 +140,21 @@ class Pipeline:
                 timeout=self._settings.domain_time_budget,
             )
         except asyncio.TimeoutError:
-            log.warning("domain %s timed out", job.domain)
+            elapsed = time.perf_counter() - start
+            log.warning(
+                "domain %s timed out after %.1fs", job.domain, elapsed,
+            )
+            # A timeout does NOT mean the site is unreachable. The site
+            # may have responded fine during fingerprinting but the
+            # detail-fetching phase ran out of budget. Classify as
+            # NO_LISTINGS_FOUND so the error log accurately reflects
+            # that the site was reachable but we couldn't extract in
+            # time. Genuinely unreachable sites are caught earlier by
+            # the fingerprint probe and never reach the timeout path.
             result = DomainResult(
                 domain=job.domain,
                 status=DomainStatus.FAILED,
-                reason=ErrorReason.SITE_NOT_REACHABLE,
+                reason=ErrorReason.NO_LISTINGS_FOUND,
                 strategy=Strategy.NONE,
             )
         except Exception as exc:  # noqa: BLE001
@@ -165,6 +175,14 @@ class Pipeline:
         dynamic: DynamicExtractor,
         fetcher,
     ) -> DomainResult:
+        domain_start = time.perf_counter()
+        budget = self._settings.domain_time_budget
+        # Reserve 20% of the domain budget as a minimum threshold for
+        # starting a fallback extraction strategy. If the primary
+        # strategy consumed most of the budget, attempting a second
+        # strategy will almost certainly time out and waste resources.
+        min_fallback_budget = budget * 0.20
+
         log.info("start %s", job.domain)
         fingerprint = await fingerprint_site(job.url, fetcher)
 
@@ -182,19 +200,28 @@ class Pipeline:
         listings: list[Listing] = []
         used = Strategy.NONE
 
+        def _remaining() -> float:
+            return budget - (time.perf_counter() - domain_start)
+
         if fingerprint.suggested_strategy == Strategy.STATIC:
             listings = await static.gather_listings(job, fingerprint)
             used = Strategy.STATIC
-            if not listings:
-                # Static run yielded nothing - try dynamic if available.
+            if not listings and _remaining() > min_fallback_budget:
+                # Static run yielded nothing and we have enough budget
+                # left for a meaningful dynamic attempt.
                 listings = await self._try_dynamic(job, dynamic, fingerprint)
                 if listings:
                     used = Strategy.HYBRID
         else:
             listings = await self._try_dynamic(job, dynamic, fingerprint)
             used = Strategy.DYNAMIC if listings else Strategy.NONE
-            if not listings and fingerprint.failure_reason != ErrorReason.BLOCKED_403:
-                # Last-ditch static attempt for misclassified sites.
+            if (
+                not listings
+                and fingerprint.failure_reason != ErrorReason.BLOCKED_403
+                and _remaining() > min_fallback_budget
+            ):
+                # Last-ditch static attempt for misclassified sites,
+                # only if we have enough budget remaining.
                 static_listings = await static.gather_listings(job, fingerprint)
                 if static_listings:
                     listings = static_listings

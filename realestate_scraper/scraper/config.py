@@ -39,16 +39,18 @@ class Settings(BaseSettings):
     domain_concurrency: int = Field(default=12, ge=1, le=256)
     per_host_concurrency: int = Field(default=4, ge=1, le=64)
     listing_concurrency: int = Field(default=24, ge=1, le=256)
-    browser_concurrency: int = Field(default=3, ge=1, le=32)
+    browser_concurrency: int = Field(default=4, ge=1, le=32)
 
     # --- Timeouts ---
-    http_probe_timeout: float = Field(default=8.0, gt=0)
-    http_fetch_timeout: float = Field(default=15.0, gt=0)
-    # 90s caps wall-clock at (jobs / workers) * 90 for the worst case.
-    # The pipeline already escalates static -> dynamic -> per-page
-    # Playwright internally, so 180s is no longer needed.
-    domain_time_budget: float = Field(default=90.0, gt=0)
-    browser_nav_timeout: float = Field(default=20.0, gt=0)
+    http_probe_timeout: float = Field(default=6.0, gt=0)
+    http_fetch_timeout: float = Field(default=10.0, gt=0)
+    # 120s covers: fingerprint (~3s) + discovery (~8s) + detail phase.
+    # Detail phase worst case: 120 URLs / 24 concurrent * 10s = 50s.
+    # Total worst case: ~61s, leaving 59s headroom for slow hosts and
+    # Playwright escalation. At 55k+ scale: (55000 / 12) * 120s = 153h
+    # worst case, but checkpoint resume makes this a non-issue.
+    domain_time_budget: float = Field(default=120.0, gt=0)
+    browser_nav_timeout: float = Field(default=15.0, gt=0)
 
     # --- Limits ---
     max_listing_urls_per_domain: int = Field(default=120, ge=1)
@@ -59,10 +61,10 @@ class Settings(BaseSettings):
     # Hard wall-clock cap on processing a single listing URL (httpx
     # + optional Playwright fallback + parse + resolver pipeline).
     # A URL that does not yield within this budget is dropped; the
-    # other candidates continue. 12 s comfortably covers a slow
-    # Apimo httpx fetch plus a clean Playwright fallback, while
-    # ensuring no single URL can dominate the per-domain budget.
-    listing_time_budget: float = Field(default=12.0, gt=0)
+    # other candidates continue. 10s is aligned with the fetch timeout
+    # so a URL that times out on fetch is dropped immediately rather
+    # than consuming additional budget on parse attempts.
+    listing_time_budget: float = Field(default=10.0, gt=0)
 
     # --- Behaviour ---
     verify_tls: bool = Field(default=False)
