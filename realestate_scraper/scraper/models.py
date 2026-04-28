@@ -34,21 +34,26 @@ LISTING_FIELDS: tuple[str, ...] = (
 
 ERROR_FIELDS: tuple[str, ...] = ("domain", "status", "reason")
 
-# Path fragments that prove the source URL is a CMS / informational
+# Path SEGMENTS that prove the source URL is a CMS / informational
 # page rather than a real property detail page. These pages routinely
 # carry a single euro amount (an agency fee, a tax illustration, a
 # headline) plus the agency name, and would otherwise pass the
 # field-count anchor in `Listing.is_publishable`. The guard is an
 # additional check on top of the existing rules; it never widens
 # acceptance, only narrows it.
-_NON_LISTING_URL_FRAGMENTS: tuple[str, ...] = (
-    "/i/redac/", "/honoraires", "/mentions", "/cookies",
-    "/privacy", "/cgu", "/cgv", "/legal",
-    "/contact", "/equipe", "/team",
-    "/agences/", "/actualites/",
-    "/blog/", "/article/", "/news/",
-    "/page/",
-)
+#
+# Stored as exact segment names (no leading or trailing slash) and
+# matched against the slash-split URL path so a substring like
+# `/biens/contactville/123` does not collide with the `contact`
+# segment. The match is case-insensitive at lookup time.
+_NON_LISTING_URL_SEGMENTS: frozenset[str] = frozenset({
+    "i", "redac", "honoraires", "mentions", "mentions-legales",
+    "cookies", "privacy", "cgu", "cgv", "legal",
+    "contact", "equipe", "team",
+    "agences", "actualites",
+    "blog", "article", "articles", "news",
+    "page", "pages",
+})
 
 DOMAIN_SUMMARY_FIELDS: tuple[str, ...] = (
     "domain",
@@ -161,10 +166,13 @@ class Listing:
         # CMS / informational page guard: reject before counting
         # informative fields so a page with a fee amount + agency
         # metadata cannot leak through the price-anchor branch.
+        # Slash-bounded segment match: a path like `/contactville/`
+        # is NOT rejected by the `contact` entry.
         url_path = (self.source_url or "").lower().split("?", 1)[0]
         if url_path:
-            for fragment in _NON_LISTING_URL_FRAGMENTS:
-                if fragment in url_path:
+            segments = [seg for seg in url_path.split("/") if seg]
+            for segment in segments:
+                if segment in _NON_LISTING_URL_SEGMENTS:
                     return False
 
         informative = (
