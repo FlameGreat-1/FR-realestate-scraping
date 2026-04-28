@@ -93,8 +93,37 @@ def parse_page(
     )
 
 
+def _safe_resolve(resolver, ctx: PageContext) -> str:
+    """Run `resolver.resolve(ctx)` and return its value, or empty on crash.
+
+    Resolvers are pure-CPU Python code, but real-world HTML can drive
+    any of them into pathological behaviour (regex backtracking,
+    selectolax tree walks on malformed DOM, KeyError on missing
+    JSON-LD shapes, ...). A resolver crash MUST NOT take down the
+    entire listing - the other 11 fields are independent and useful
+    on their own.
+
+    Catches `Exception` (not BaseException) so KeyboardInterrupt /
+    SystemExit / asyncio.CancelledError still propagate normally.
+    """
+    try:
+        return resolver.resolve(ctx).value
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "resolver %s crashed on %s: %s",
+            getattr(resolver, "name", resolver.__class__.__name__),
+            ctx.url, exc,
+        )
+        return ""
+
+
 def build_listing(ctx: PageContext) -> Listing:
-    """Run every resolver on `ctx` and assemble a `Listing`."""
+    """Run every resolver on `ctx` and assemble a `Listing`.
+
+    Each resolver runs through `_safe_resolve` so that a crash in one
+    field never aborts assembly of the others. The publishability
+    rule on the result still decides whether the listing is emitted.
+    """
     job = ctx.domain_job
     listing = Listing(
         source_url=canonicalize(ctx.url) or ctx.url,
@@ -102,17 +131,17 @@ def build_listing(ctx: PageContext) -> Listing:
         agency_name=(job.agency_name if job else ""),
     )
 
-    listing.price = _PRICE.resolve(ctx).value
-    listing.reference_id = _REFERENCE.resolve(ctx).value
-    listing.property_type = _PROPERTY_TYPE.resolve(ctx).value
-    listing.surface_area = _SURFACE.resolve(ctx).value
-    listing.rooms = _ROOMS.resolve(ctx).value
-    listing.bedrooms = _BEDROOMS.resolve(ctx).value
-    listing.dpe_rating = _DPE.resolve(ctx).value
-    listing.location = _LOCATION.resolve(ctx).value
-    listing.coordinates = _COORDS.resolve(ctx).value
-    listing.phone_number = _PHONE.resolve(ctx).value
-    listing.email = _EMAIL.resolve(ctx).value
-    listing.agent_name = _AGENT.resolve(ctx).value
+    listing.price = _safe_resolve(_PRICE, ctx)
+    listing.reference_id = _safe_resolve(_REFERENCE, ctx)
+    listing.property_type = _safe_resolve(_PROPERTY_TYPE, ctx)
+    listing.surface_area = _safe_resolve(_SURFACE, ctx)
+    listing.rooms = _safe_resolve(_ROOMS, ctx)
+    listing.bedrooms = _safe_resolve(_BEDROOMS, ctx)
+    listing.dpe_rating = _safe_resolve(_DPE, ctx)
+    listing.location = _safe_resolve(_LOCATION, ctx)
+    listing.coordinates = _safe_resolve(_COORDS, ctx)
+    listing.phone_number = _safe_resolve(_PHONE, ctx)
+    listing.email = _safe_resolve(_EMAIL, ctx)
+    listing.agent_name = _safe_resolve(_AGENT, ctx)
 
     return listing
