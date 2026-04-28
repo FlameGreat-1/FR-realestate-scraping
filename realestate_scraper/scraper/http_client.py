@@ -142,14 +142,34 @@ class HttpFetcher:
         )
 
     async def probe(self, url: str) -> ProbeResult:
-        """Reachability probe with www/scheme variant fallback."""
+        """Reachability probe with www/scheme variant fallback.
+
+        All variants are probed concurrently; the first successful
+        response wins. This reduces worst-case probe time from
+        N * timeout to max(timeout) for unreachable hosts.
+        """
         if not url:
             return ProbeResult(status_code=None, final_url=url)
 
-        for candidate in probe_variants(url):
+        variants = probe_variants(url)
+        if not variants:
+            return ProbeResult(status_code=None, final_url=url)
+
+        async def _try(candidate: str) -> tuple[str, Optional[int]]:
             status = await self._probe_single(candidate)
-            if status is not None:
-                return ProbeResult(status_code=status, final_url=candidate)
+            return candidate, status
+
+        tasks = [asyncio.create_task(_try(v)) for v in variants]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                candidate, status = await coro
+                if status is not None:
+                    return ProbeResult(status_code=status, final_url=candidate)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         return ProbeResult(status_code=None, final_url=url)
 
     async def _probe_single(self, url: str) -> Optional[int]:
