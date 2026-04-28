@@ -276,13 +276,20 @@ async def open_fetcher(settings: Settings) -> AsyncIterator[HttpFetcher]:
     limits = httpx.Limits(
         max_keepalive_connections=settings.domain_concurrency * 4,
         max_connections=settings.domain_concurrency * 8,
-        keepalive_expiry=30.0,
+        # Shorter keepalive: idle connections from processed domains
+        # hold pool slots that active domains need. At scale, 30s
+        # keepalive on hundreds of hosts wastes connection capacity.
+        keepalive_expiry=15.0,
     )
     timeout = httpx.Timeout(
-        connect=min(settings.http_probe_timeout, 8.0),
+        connect=min(settings.http_probe_timeout, 6.0),
         read=settings.http_fetch_timeout,
         write=settings.http_fetch_timeout,
-        pool=settings.http_fetch_timeout,
+        # Pool timeout is deliberately shorter than fetch timeout.
+        # A request that cannot acquire a connection within 5s should
+        # fail fast so the per-listing wall-clock guard can drop it
+        # and move on, rather than blocking silently in the pool queue.
+        pool=5.0,
     )
     transport = httpx.AsyncHTTPTransport(
         retries=0,
