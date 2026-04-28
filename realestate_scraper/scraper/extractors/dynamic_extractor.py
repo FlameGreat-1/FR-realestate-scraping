@@ -154,26 +154,38 @@ class DynamicExtractor:
         tasks = [
             asyncio.create_task(_bounded_process(url)) for url in candidates
         ]
-        for coro in asyncio.as_completed(tasks):
-            try:
-                listing = await coro
-            except Exception as exc:  # noqa: BLE001
-                # Defensive: any leak from _bounded_process must not
-                # abort the entire gather. The other 119 candidates
-                # are independent.
-                log.debug("dynamic: task crashed: %s", exc)
-                continue
-            if listing is None:
-                continue
-            key = (
-                f"{listing.source_domain}|{listing.reference_id}".lower()
-                if listing.reference_id
-                else dedup_key(listing.source_url)
-            )
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            results.append(listing)
+        try:
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    listing = await coro
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("dynamic: task crashed: %s", exc)
+                    continue
+                if listing is None:
+                    continue
+                key = (
+                    f"{listing.source_domain}|{listing.reference_id}".lower()
+                    if listing.reference_id
+                    else dedup_key(listing.source_url)
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                results.append(listing)
+        finally:
+            # Structured cancellation: when the domain-level wait_for
+            # fires or any exception propagates, every pending task
+            # MUST be cancelled. Without this, orphaned tasks hold
+            # browser pool slots, httpx connections, and thread pool
+            # workers indefinitely, causing cascading hangs across
+            # all subsequent domains.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Give cancelled tasks one event-loop tick to process the
+            # CancelledError so their finally blocks (semaphore
+            # releases, page closes) actually execute.
+            await asyncio.gather(*tasks, return_exceptions=True)
         return results
 
     async def _get_html(self, url: str) -> str:
