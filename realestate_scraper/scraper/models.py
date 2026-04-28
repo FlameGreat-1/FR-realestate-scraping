@@ -97,15 +97,18 @@ class Listing:
     def is_publishable(self) -> bool:
         """A listing qualifies when it carries enough listing-shaped signal.
 
-        All three conditions must hold:
+        Three conditions must all hold:
             1. At least two of the six informative fields are filled.
-            2. EITHER price or reference_id is filled (the two strong
-               anchors that hub / template pages cannot fake), OR
-               surface_area AND at least one of
-               {rooms, location, property_type} are filled.
-            3. Trivially-empty informative fields are not counted in
-               the filled tally (whitespace-only values are treated
-               as absent).
+            2. The page carries a real structural anchor:
+                 - price set (price is the strongest single anchor;
+                   real sale pages always render an amount), OR
+                 - reference_id set AND at least one property-intrinsic
+                   companion field (surface_area, rooms, property_type)
+                   is also set, OR
+                 - surface_area set AND at least one of
+                   {rooms, location, property_type} is set.
+            3. Trivially-empty informative fields are not counted
+               (whitespace-only values are treated as absent).
 
         Informative fields are the six the brief uses to describe a
         property:
@@ -124,6 +127,17 @@ class Listing:
         the ghost while preserving every real detail page (real
         listings always set surface + at least one of rooms /
         location / property_type).
+
+        Why reference_id alone is not enough: search-result index
+        URLs (`/lots/<id>`, `/biens/<id>`) on Hektor / Apimo CMSes
+        produce reference-shaped slugs that pass every URL-level
+        filter, but the page itself has no price, no surface, no
+        rooms - it is an index, not a detail page. Requiring a
+        property-intrinsic companion (surface_area, rooms,
+        property_type) removes those ghosts. `location` is
+        deliberately NOT a valid companion to reference because on a
+        reference-only row the location almost always comes from the
+        agency CSV fallback, not from the page itself.
         """
         def _set(value: str) -> bool:
             return bool((value or "").strip())
@@ -135,8 +149,17 @@ class Listing:
         if sum(1 for v in informative if _set(v)) < 2:
             return False
 
-        # Strong anchors: price or reference_id alone is sufficient.
-        if _set(self.price) or _set(self.reference_id):
+        # Strongest single anchor: price.
+        if _set(self.price):
+            return True
+
+        # Reference-as-anchor only when paired with a property-intrinsic
+        # companion. `location` is excluded by design (see docstring).
+        if _set(self.reference_id) and any(
+            _set(v) for v in (
+                self.surface_area, self.rooms, self.property_type,
+            )
+        ):
             return True
 
         # Surface-as-anchor only when paired with another descriptor.
