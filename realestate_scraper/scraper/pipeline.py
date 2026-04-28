@@ -86,6 +86,15 @@ class Pipeline:
 
         async with open_fetcher(self._settings) as fetcher:
             browser_pool = BrowserPool(self._settings)
+            # Pre-warm the Chromium browser process ONCE before any
+            # worker spawns. The lazy-on-first-borrow shape charged
+            # the launch cost (~1-3 s) to whichever domain happened
+            # to acquire the browser pool first - that is wrong
+            # engineering at any scale. Failure here is non-fatal:
+            # `is_available` returns False and the dynamic path
+            # gracefully degrades to the static-only fallback that
+            # the rest of the pipeline already handles.
+            await browser_pool.start()
             try:
                 static = StaticExtractor(self._settings, fetcher)
                 dynamic = DynamicExtractor(self._settings, browser_pool, fetcher)

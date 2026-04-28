@@ -5,6 +5,8 @@ Responsibilities:
     * Fetch each candidate concurrently (bounded), parse, and emit a
       `Listing` whenever a publishable record is produced.
     * Apply per-domain dedup of canonical URLs to avoid double work.
+    * Enforce a per-listing wall-clock cap so a single slow URL
+      cannot dominate the per-domain budget.
 
 Discovery (sitemap + homepage harvest + bounded hub BFS) lives in the
 shared `extractors.discovery` module so the dynamic path can reuse
@@ -57,6 +59,7 @@ class StaticExtractor:
 
         results: list[Listing] = []
         seen_keys: set[str] = set()
+        listing_budget = self._settings.listing_time_budget
 
         async def _process(url: str) -> Listing | None:
             async with self._listing_sem:
@@ -73,9 +76,41 @@ class StaticExtractor:
                 return None
             return listing
 
-        tasks = [asyncio.create_task(_process(url)) for url in candidates]
+        async def _bounded_process(url: str) -> Listing | None:
+            """Per-listing wall-clock guard.
+
+            Mirrors the dynamic extractor's bound (Round 6). A URL
+            whose httpx fetch + parse + resolver pipeline does not
+            complete inside `listing_time_budget` is dropped
+            silently. The other candidates are independent and
+            continue.
+            """
+            try:
+                return await asyncio.wait_for(
+                    _process(url), timeout=listing_budget,
+                )
+            except asyncio.TimeoutError:
+                log.debug(
+                    "static: listing %s exceeded %.1fs budget, dropping",
+                    url, listing_budget,
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001
+                log.debug("static: listing %s failed: %s", url, exc)
+                return None
+
+        tasks = [
+            asyncio.create_task(_bounded_process(url)) for url in candidates
+        ]
         for coro in asyncio.as_completed(tasks):
-            listing = await coro
+            try:
+                listing = await coro
+            except Exception as exc:  # noqa: BLE001
+                # Defensive: any leak from `_bounded_process` must not
+                # abort the entire gather. The other candidates are
+                # independent.
+                log.debug("static: task crashed: %s", exc)
+                continue
             if listing is None:
                 continue
             key = (
