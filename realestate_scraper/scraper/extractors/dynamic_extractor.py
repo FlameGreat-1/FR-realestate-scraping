@@ -27,8 +27,17 @@ Design:
     Per-page Playwright escalation:
         If a detail-URL httpx fetch returns 401/403/429, that single
         URL is rendered in Playwright. The escalation is bounded by
-        the browser pool semaphore and the per-page navigation
-        timeout, so it cannot dominate the runtime.
+        the browser pool semaphore, the per-page navigation timeout,
+        and a hard per-listing wall-clock cap so one slow URL cannot
+        dominate the per-domain runtime.
+
+    Per-listing wall-clock cap:
+        Every candidate URL runs inside `asyncio.wait_for(
+            timeout=settings.listing_time_budget)`. A URL that does
+        not yield within this budget is dropped silently; the other
+        119 candidates continue. This is the only safe shape when
+        multiple shared resources (browser pool, httpx pool, per-host
+        limiter) can interact in unexpected ways.
 
 This keeps Playwright cost proportional to the *blocked subset* of a
 domain and gives the dynamic path the same discovery coverage as the
@@ -54,16 +63,15 @@ log = logging.getLogger(__name__)
 
 _BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 429})
 
-# Opportunistic post-domcontentloaded settle wait. Capped low enough
-# that a slow site cannot dominate the per-domain budget, and high
-# enough to let JS redirects / WAF interstitials complete before we
-# read `page.content()` (which is what causes the "Execution context
-# destroyed" race when the wait is omitted).
+# Networkidle wait is reserved for the homepage path where JS / WAF
+# interstitials redirect to the real homepage. Detail pages return
+# clean HTML on `domcontentloaded` and the extra wait is pure cost.
 _NETWORK_IDLE_TIMEOUT_MS: int = 2_000
-# Brief settle delay between render attempts. A navigation race
-# almost always resolves on the second try because the redirect /
-# challenge has had time to complete.
-_RETRY_SETTLE_SECONDS: float = 0.4
+# Brief settle delay between homepage render attempts. A navigation
+# race almost always resolves on the second try because the redirect
+# / challenge has had time to complete. Detail pages do NOT retry -
+# we have 119 alternatives so paying this cost there is wasteful.
+_HOMEPAGE_RETRY_SETTLE_SECONDS: float = 0.4
 
 
 class DynamicExtractor:
@@ -104,6 +112,7 @@ class DynamicExtractor:
 
         results: list[Listing] = []
         seen_keys: set[str] = set()
+        listing_budget = self._settings.listing_time_budget
 
         async def _process(url: str) -> Optional[Listing]:
             html = await self._get_html(url)
@@ -115,9 +124,40 @@ class DynamicExtractor:
                 return None
             return listing
 
-        tasks = [asyncio.create_task(_process(url)) for url in candidates]
+        async def _bounded_process(url: str) -> Optional[Listing]:
+            """Per-listing wall-clock guard.
+
+            A single URL must NEVER dominate the per-domain budget,
+            even when shared resources (browser pool, httpx pool,
+            per-host limiter) interact in unexpected ways. The wait_for
+            cap is the architectural guarantee.
+            """
+            try:
+                return await asyncio.wait_for(
+                    _process(url), timeout=listing_budget,
+                )
+            except asyncio.TimeoutError:
+                log.debug(
+                    "dynamic: listing %s exceeded %.1fs budget, dropping",
+                    url, listing_budget,
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001
+                log.debug("dynamic: listing %s failed: %s", url, exc)
+                return None
+
+        tasks = [
+            asyncio.create_task(_bounded_process(url)) for url in candidates
+        ]
         for coro in asyncio.as_completed(tasks):
-            listing = await coro
+            try:
+                listing = await coro
+            except Exception as exc:  # noqa: BLE001
+                # Defensive: any leak from _bounded_process must not
+                # abort the entire gather. The other 119 candidates
+                # are independent.
+                log.debug("dynamic: task crashed: %s", exc)
+                continue
             if listing is None:
                 continue
             key = (
@@ -144,20 +184,25 @@ class DynamicExtractor:
         return ""
 
     async def _render_with_playwright(self, url: str) -> str:
-        """Last-resort per-page Playwright render with race-safe content read."""
-        for attempt in (1, 2):
-            html = await self._safe_render(url, target_url=url)
-            if html:
-                return html
-            if attempt == 1:
-                # Brief settle delay before retrying. A navigation race
-                # almost always resolves on the second attempt because
-                # the redirect / WAF challenge has had time to complete.
-                await asyncio.sleep(_RETRY_SETTLE_SECONDS)
-        return ""
+        """Single-attempt per-page Playwright render.
+
+        No retry: detail pages have 119 alternatives, and the wall-
+        clock cost of a second attempt outweighs the marginal
+        coverage gain. Networkidle wait is also disabled here -
+        it is only worth the wait on the homepage path where WAF
+        interstitials redirect.
+        """
+        return await self._safe_render(
+            url, target_url=url, wait_for_idle=False,
+        )
 
     async def _render_homepage(self, job: DomainJob) -> tuple[str, str]:
-        """Render the homepage in Playwright, return (html, final_url).
+        """Render the homepage in Playwright with a single retry.
+
+        Two attempts are used here (and ONLY here) because homepage
+        coverage is critical: a missed homepage means missing the
+        anchor seed for every detail page. Detail pages have 119
+        alternatives so a render miss is harmless.
 
         Errors return empty strings; the caller falls back to the
         fingerprint's cached HTML so a flaky Playwright launch does
@@ -165,12 +210,13 @@ class DynamicExtractor:
         """
         for attempt in (1, 2):
             html, final_url = await self._safe_render(
-                job.url, target_url=job.url, return_final_url=True,
+                job.url, target_url=job.url,
+                wait_for_idle=True, return_final_url=True,
             )
             if html:
                 return html, final_url or job.url
             if attempt == 1:
-                await asyncio.sleep(_RETRY_SETTLE_SECONDS)
+                await asyncio.sleep(_HOMEPAGE_RETRY_SETTLE_SECONDS)
         return "", ""
 
     async def _safe_render(
@@ -178,26 +224,30 @@ class DynamicExtractor:
         url: str,
         *,
         target_url: str,
+        wait_for_idle: bool = False,
         return_final_url: bool = False,
     ):
         """Render `url` once, returning HTML (and optionally the final URL).
 
-        Layered waits handle two distinct failure modes:
+        :param wait_for_idle:
+            When True, await `networkidle` (capped at
+            `_NETWORK_IDLE_TIMEOUT_MS`) after `domcontentloaded` so
+            JS redirects and WAF interstitials resolve before we read
+            `page.content()`. Reserved for the homepage path; detail
+            pages do not need it and pay only the cost.
+
+        Robustness handles two distinct failure modes:
           * `domcontentloaded` is the primary wait: fast, sufficient
             for the majority of pages.
-          * `networkidle` is an opportunistic secondary wait capped at
-            `_NETWORK_IDLE_TIMEOUT_MS`. It lets JS redirects and WAF
-            interstitials resolve before we read `page.content()`,
-            which is what eliminates the "Execution context
-            destroyed" race observed on Round 3.
           * `page.content()` is wrapped in a try/except: a navigation
             race that kills the execution context surfaces as a
-            Playwright Error, and the caller will retry once.
+            Playwright Error, which we treat as a permanent failure
+            for that URL (no retry at the per-detail level).
           * Status >= 400 is no longer fatal. WAF sites (Cloudflare,
             Imperva, ...) routinely serve a 403 interstitial whose
             JS then redirects to the real homepage. We let the
-            redirect happen (via the networkidle wait) and read the
-            post-redirect HTML regardless of the initial status.
+            redirect happen (when `wait_for_idle=True`) and read
+            the post-redirect HTML regardless of the initial status.
         """
         nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
         try:
@@ -211,14 +261,15 @@ class DynamicExtractor:
                 except Exception as exc:  # noqa: BLE001
                     log.debug("dynamic goto %s failed: %s", url, exc)
                     return ("", "") if return_final_url else ""
-                # Opportunistic networkidle wait. A timeout is fine -
-                # we proceed with whatever DOM is available.
-                try:
-                    await page.wait_for_load_state(
-                        "networkidle", timeout=_NETWORK_IDLE_TIMEOUT_MS,
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
+                if wait_for_idle:
+                    # Opportunistic networkidle wait. A timeout is fine -
+                    # we proceed with whatever DOM is available.
+                    try:
+                        await page.wait_for_load_state(
+                            "networkidle", timeout=_NETWORK_IDLE_TIMEOUT_MS,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     html = await page.content()
                 except Exception as exc:  # noqa: BLE001

@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     max_sitemap_depth: int = Field(default=2, ge=1, le=5)
     seed_expansion_depth: int = Field(default=2, ge=0, le=4)
     max_hub_pages_per_domain: int = Field(default=12, ge=0, le=128)
+    # Hard wall-clock cap on processing a single listing URL (httpx
+    # + optional Playwright fallback + parse + resolver pipeline).
+    # A URL that does not yield within this budget is dropped; the
+    # other candidates continue. 12 s comfortably covers a slow
+    # Apimo httpx fetch plus a clean Playwright fallback, while
+    # ensuring no single URL can dominate the per-domain budget.
+    listing_time_budget: float = Field(default=12.0, gt=0)
 
     # --- Behaviour ---
     verify_tls: bool = Field(default=False)
