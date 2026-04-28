@@ -64,6 +64,13 @@ _COMMUNE_TOKEN = (
 _TITLE_COMMUNE_POSTAL = re.compile(
     rf"\b({_COMMUNE_TOKEN})\s*\(?(\d{{5}})\)?\b",
 )
+# Postal-first variant: `75011 Paris`, `33000 Bordeaux`. Some Hektor /
+# WP templates render postal codes before the commune name. We accept
+# the same commune token shape so a future change to `_COMMUNE_TOKEN`
+# applies to both directions automatically.
+_TITLE_POSTAL_COMMUNE = re.compile(
+    rf"\b(\d{{5}})\s+({_COMMUNE_TOKEN})\b",
+)
 # Body postal scan: a 5-digit postal code immediately preceded by a
 # capitalised word (or hyphenated capitalised compound). Tight enough
 # to not match unrelated numeric runs and city-less postal lists.
@@ -316,9 +323,11 @@ def _accept_commune_candidate(value: str) -> str:
 def _from_title_or_h1(*texts: str) -> str:
     """Scan page title / h1 strings for the rightmost commune candidate.
 
-    Two complementary patterns are evaluated, in this order:
+    Three complementary patterns are evaluated, in this order:
       * `à <Commune>` (`a/au/at`): the strongest French shape because
         the preposition is unambiguous on listing titles.
+      * `<postal> <Commune>` (postal-first): the inverse layout used
+        by some Hektor / WP templates (`75011 Paris - Appartement`).
       * `<Commune> (<postal>)` / `<Commune> <postal>`: catches titles
         that ship the postal code inline.
     The first candidate that passes the shape gate wins. Each scan is
@@ -339,6 +348,13 @@ def _from_title_or_h1(*texts: str) -> str:
             cleaned = _accept_commune_candidate(match.group(1))
             if cleaned:
                 return cleaned
+        match = _TITLE_POSTAL_COMMUNE.search(text)
+        if match:
+            postal = match.group(1)
+            commune = match.group(2)
+            cleaned = _accept_commune_candidate(commune)
+            if cleaned:
+                return f"{cleaned} {postal}"
         match = _TITLE_COMMUNE_POSTAL.search(text)
         if match:
             commune = match.group(1)
