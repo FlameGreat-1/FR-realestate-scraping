@@ -6,79 +6,57 @@ contract is identical to the static path.
 
 Design:
     The expensive part of dynamic extraction is *navigation*, not
-    parsing. So we minimise it:
+    parsing. So we minimise it.
 
-    1. Use Playwright to render the homepage and harvest anchors.
-       This is the only step that genuinely needs JS or Cloudflare
-       cookie negotiation.
-    2. Fetch every detail URL via the shared HttpFetcher (httpx) with
-       the rotated UA + client-hint profile. Most WAF-protected sites
-       only challenge the homepage; detail pages serve clean HTML to
-       a request that already presents a coherent fingerprint.
-    3. If a single detail URL returns 401/403/429 via httpx, escalate
-       only that URL to Playwright. The escalation is bounded by the
-       browser pool semaphore and the per-page navigation timeout, so
-       it cannot dominate the runtime.
+    Discovery:
+        Playwright is used for one thing only: rendering the
+        homepage so JS execution and Cloudflare cookie negotiation
+        happen there. The rendered homepage HTML is then fed into
+        the shared `CandidateDiscovery` component, which runs the
+        same sitemap + anchor + bounded hub BFS pipeline as the
+        static path - all over httpx, never touching Chromium for
+        discovery itself.
 
-This keeps the Playwright cost proportional to the *blocked subset*
-of a domain instead of the full candidate set.
+    Detail fetching:
+        Each candidate URL is fetched via the shared HttpFetcher
+        with the rotated UA + client-hint profile that matches the
+        Playwright session. WAF-protected sites typically only
+        challenge the homepage; detail pages serve clean HTML once
+        the request presents a coherent fingerprint.
+
+    Per-page Playwright escalation:
+        If a detail-URL httpx fetch returns 401/403/429, that single
+        URL is rendered in Playwright. The escalation is bounded by
+        the browser pool semaphore and the per-page navigation
+        timeout, so it cannot dominate the runtime.
+
+This keeps Playwright cost proportional to the *blocked subset* of a
+domain and gives the dynamic path the same discovery coverage as the
+static path, instead of the homepage-anchors-only fallback that was
+the Round-1 default.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Iterable, Optional
+from typing import Optional
 
 from ..browser_pool import BrowserPool
 from ..config import Settings
 from ..fingerprint import Fingerprint
 from ..http_client import FetchOutcome, HttpFetcher
-from ..listing_filter import classify_url
 from ..models import DomainJob, Listing
-from ..seed_discovery import _extract_anchor_hrefs
-from ..utils.url import (
-    canonicalize,
-    dedup_key,
-    join_url,
-    same_registrable_domain,
-)
+from ..utils.url import dedup_key
+from .discovery import CandidateDiscovery
 from .pipeline_extract import build_listing, parse_page
 
 log = logging.getLogger(__name__)
 
-_DYNAMIC_LIMIT_DIVISOR = 3
 _BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 429})
 
 
-def _rank_and_limit(
-    urls: Iterable[str],
-    base_url: str,
-    families: tuple,
-    limit: int,
-) -> list[str]:
-    seen: set[str] = set()
-    scored: list[tuple[int, str]] = []
-    for raw in urls:
-        if not raw or not same_registrable_domain(raw, base_url):
-            continue
-        canonical = canonicalize(raw)
-        key = canonical.lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        verdict = classify_url(canonical)
-        if not verdict.accepted:
-            continue
-        score = verdict.score
-        for family in families or ():
-            score += family.boost_url(canonical)
-        scored.append((score, canonical))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return [url for _, url in scored[:limit]]
-
-
 class DynamicExtractor:
-    """Pulls listings using a headless Chromium instance for discovery only."""
+    """Listings extractor that uses Playwright only where it is needed."""
 
     def __init__(
         self,
@@ -89,6 +67,7 @@ class DynamicExtractor:
         self._settings = settings
         self._pool = browser_pool
         self._fetcher = fetcher
+        self._discovery = CandidateDiscovery(settings, fetcher)
         self._listing_sem = asyncio.Semaphore(settings.listing_concurrency)
 
     @property
@@ -170,13 +149,13 @@ class DynamicExtractor:
             log.debug("dynamic page render %s failed: %s", url, exc)
             return ""
 
-    async def _discover_candidates(
-        self,
-        job: DomainJob,
-        fingerprint: Fingerprint,
-    ) -> list[str]:
-        """Render the homepage in a browser, then harvest its anchors."""
-        urls: list[str] = []
+    async def _render_homepage(self, job: DomainJob) -> tuple[str, str]:
+        """Render the homepage in Playwright, return (html, final_url).
+
+        Errors return empty strings; the caller falls back to the
+        fingerprint's cached HTML so a flaky Playwright launch does
+        not cost us all coverage on the domain.
+        """
         nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
         try:
             async with self._pool.page(target_url=job.url) as page:
@@ -185,27 +164,36 @@ class DynamicExtractor:
                     wait_until="domcontentloaded",
                     timeout=nav_timeout_ms,
                 )
-                if response is not None and response.status < 400:
-                    html = await page.content()
-                    base = str(page.url) or job.url
-                    for href in _extract_anchor_hrefs(html or ""):
-                        absolute = join_url(base, href)
-                        if absolute.startswith(("http://", "https://")):
-                            urls.append(absolute)
+                if response is None or response.status >= 400:
+                    return "", ""
+                html = await page.content()
+                return html or "", str(page.url) or job.url
         except Exception as exc:  # noqa: BLE001
             log.debug("dynamic homepage harvest %s failed: %s", job.url, exc)
+            return "", ""
 
-        # If Playwright is unavailable or the rendered homepage was
-        # empty, fall back to whatever the fingerprint already captured.
-        if not urls and fingerprint.homepage_html:
-            base = fingerprint.final_url or job.url
-            for href in _extract_anchor_hrefs(fingerprint.homepage_html):
-                absolute = join_url(base, href)
-                if absolute.startswith(("http://", "https://")):
-                    urls.append(absolute)
+    async def _discover_candidates(
+        self,
+        job: DomainJob,
+        fingerprint: Fingerprint,
+    ) -> list[str]:
+        """Build the full candidate list using the shared discovery.
 
-        limit = max(
-            10,
-            self._settings.max_listing_urls_per_domain // _DYNAMIC_LIMIT_DIVISOR,
+        Playwright renders the homepage; the rendered HTML feeds the
+        same sitemap + anchor + hub-BFS pipeline the static path uses.
+        """
+        rendered_html, rendered_base = await self._render_homepage(job)
+
+        if not rendered_html:
+            # Playwright failed or returned nothing. Fall back to the
+            # fingerprint's cached HTML so we never lose discovery
+            # coverage to a transient browser failure.
+            rendered_html = fingerprint.homepage_html or ""
+            rendered_base = fingerprint.final_url or job.url
+
+        return await self._discovery.discover(
+            job,
+            fingerprint.families,
+            homepage_html=rendered_html or None,
+            base_url=rendered_base or job.url,
         )
-        return _rank_and_limit(urls, job.url, fingerprint.families, limit)
