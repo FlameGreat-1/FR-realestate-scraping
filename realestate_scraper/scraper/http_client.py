@@ -153,22 +153,28 @@ class HttpFetcher:
         return ProbeResult(status_code=None, final_url=url)
 
     async def _probe_single(self, url: str) -> Optional[int]:
-        """Send one HEAD (then GET) probe to a specific URL."""
-        headers = self.headers_for(url)
+        """Send one ranged GET probe to a specific URL.
+
+        Many WAFs return 405 on HEAD but serve GET, so a HEAD-first
+        scheme always paid the doubled round-trip cost on those hosts.
+        We instead issue one GET with a 2 KB Range header, which is
+        cheap on the wire (truncated body), still tells us whether the
+        host answers, and keeps redirect/auth semantics intact.
+        """
+        headers = dict(self.headers_for(url))
+        headers["Range"] = "bytes=0-2047"
         async with self._limiter.slot(url):
-            for method in ("HEAD", "GET"):
-                try:
-                    response = await self._client.request(
-                        method,
-                        url,
-                        timeout=self._probe_timeout,
-                        headers=headers,
-                    )
-                    return response.status_code
-                except httpx.HTTPError as exc:
-                    log.debug("probe %s %s failed: %s", method, url, exc)
-                    continue
-        return None
+            try:
+                response = await self._client.request(
+                    "GET",
+                    url,
+                    timeout=self._probe_timeout,
+                    headers=headers,
+                )
+                return response.status_code
+            except httpx.HTTPError as exc:
+                log.debug("probe GET %s failed: %s", url, exc)
+                return None
 
     async def fetch(
         self,

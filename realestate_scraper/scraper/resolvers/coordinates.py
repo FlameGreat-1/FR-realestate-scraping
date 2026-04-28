@@ -7,12 +7,12 @@ invoked only when this resolver returned nothing.
 Signals checked, top to bottom:
     1. JSON-LD `geo`.
     2. OpenGraph / place / geo `<meta>` tags.
-    3. Leaflet conventions: `L.marker([lat, lng])`, `L.latLng(lat, lng)`,
+    3. `data-lat*` / `data-lng*` / `data-latitude` / `data-longitude`
+       attributes on any element. Stable across CMS template churn.
+    4. Leaflet conventions: `L.marker([lat, lng])`, `L.latLng(lat, lng)`,
        `map.setView([lat, lng], zoom)`.
-    4. Mapbox conventions: `center: [lng, lat]` (note: longitude first).
-    5. Generic inline `lat=...`, `latitude=...` keys.
-    6. `data-lat*` / `data-lng*` / `data-latitude` / `data-longitude`
-       attributes on any element.
+    5. Mapbox conventions: `center: [lng, lat]` (note: longitude first).
+    6. Generic inline `lat=...`, `latitude=...` keys.
     7. Google Maps iframe `src` queries.
 
 Every candidate goes through `_format_pair` which validates the
@@ -51,11 +51,11 @@ _LL_QUERY = re.compile(rf"[?&]ll=({_FLOAT}),({_FLOAT})")
 _Q_QUERY = re.compile(rf"[?&]q=({_FLOAT}),({_FLOAT})")
 _AT_PATTERN = re.compile(rf"/@({_FLOAT}),({_FLOAT})")
 
-_DATA_LAT_SELECTORS = (
-    "[data-lat]", "[data-latitude]",
-)
 _DATA_LNG_ATTRS = (
     "data-lng", "data-lon", "data-long", "data-longitude",
+)
+_DATA_LAT_ATTRS = (
+    "data-lat", "data-latitude",
 )
 
 _META_LAT = (
@@ -130,12 +130,17 @@ def _from_meta(parser: HTMLParser) -> str:
 def _from_data_attributes(parser: HTMLParser) -> str:
     """Find an element that carries both a lat and a lng data attribute."""
     try:
-        candidates = parser.css("[data-lat], [data-latitude]")
+        candidates = parser.css(
+            ", ".join(f"[{name}]" for name in _DATA_LAT_ATTRS)
+        )
     except Exception:
         return ""
     for node in candidates:
         attrs = node.attributes
-        lat = attrs.get("data-lat") or attrs.get("data-latitude")
+        lat = next(
+            (attrs.get(name) for name in _DATA_LAT_ATTRS if attrs.get(name)),
+            None,
+        )
         lng = next(
             (attrs.get(name) for name in _DATA_LNG_ATTRS if attrs.get(name)),
             None,
@@ -213,15 +218,15 @@ class CoordinatesResolver:
             if value:
                 return ResolverResult(value, 0.85, "meta")
 
-        value = _from_inline_js(ctx.html)
-        if value:
-            return ResolverResult(value, 0.8, "inline_js")
-
-        if parser is not None:
             value = _from_data_attributes(parser)
             if value:
-                return ResolverResult(value, 0.8, "data_attr")
+                return ResolverResult(value, 0.85, "data_attr")
 
+        value = _from_inline_js(ctx.html)
+        if value:
+            return ResolverResult(value, 0.75, "inline_js")
+
+        if parser is not None:
             value = _from_iframes(parser)
             if value:
                 return ResolverResult(value, 0.7, "iframe")

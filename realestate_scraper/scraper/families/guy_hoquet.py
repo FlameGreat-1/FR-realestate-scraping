@@ -16,7 +16,9 @@ GUY_HOQUET = Family(
         r"/biens?/(?:vente|location)/",
         r"/annonce[s]?/",
     ),
-    requires_dynamic=True,
+    # Detail pages serve usable static HTML. Pipeline escalates to
+    # dynamic on zero-listing static, so coverage is preserved.
+    requires_dynamic=False,
 )
 
 get_registry().register(GUY_HOQUET)

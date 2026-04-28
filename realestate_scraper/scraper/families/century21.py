@@ -17,7 +17,9 @@ CENTURY21 = Family(
         r"/annonce[s]?/detail/",
         r"-fp\d{4,}",
     ),
-    requires_dynamic=True,
+    # Detail pages serve usable static HTML; only search results
+    # require JS. Pipeline escalates to dynamic on zero-listing static.
+    requires_dynamic=False,
 )
 
 get_registry().register(CENTURY21)

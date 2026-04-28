@@ -130,25 +130,25 @@ class StaticExtractor:
         job: DomainJob,
         fingerprint: Fingerprint,
     ) -> list[str]:
-        sitemap_urls = await discover_sitemap_urls(
-            job.url,
-            self._fetcher,
-            max_depth=self._settings.max_sitemap_depth,
+        # Sitemap discovery and homepage harvest are independent
+        # network workloads; run them concurrently so the slower of
+        # the two sets the floor instead of their sum. Per-host
+        # concurrency limits are still enforced inside HttpFetcher.
+        sitemap_task = asyncio.create_task(
+            discover_sitemap_urls(
+                job.url,
+                self._fetcher,
+                max_depth=self._settings.max_sitemap_depth,
+            )
+        )
+        homepage_task = asyncio.create_task(
+            self._harvest_homepage(job, fingerprint)
+        )
+        sitemap_urls, homepage_urls = await asyncio.gather(
+            sitemap_task, homepage_task
         )
 
-        homepage_urls: list[str] = []
-        if not sitemap_urls or len(sitemap_urls) < 5:
-            _, homepage_urls = await harvest_homepage_links(job.url, self._fetcher)
-        elif fingerprint.homepage_html:
-            # Reuse what we already fetched during fingerprinting.
-            for href in _extract_anchor_hrefs(fingerprint.homepage_html):
-                absolute = join_url(fingerprint.final_url or job.url, href)
-                if absolute.startswith(("http://", "https://")) and same_registrable_domain(
-                    absolute, job.url
-                ):
-                    homepage_urls.append(absolute)
-
-        seed_urls = list(sitemap_urls) + homepage_urls
+        seed_urls = list(sitemap_urls) + list(homepage_urls)
         expanded = await self._expand_hubs(job, seed_urls)
         return _rank_and_limit(
             expanded,
@@ -156,6 +156,32 @@ class StaticExtractor:
             fingerprint.families,
             self._settings.max_listing_urls_per_domain,
         )
+
+    async def _harvest_homepage(
+        self,
+        job: DomainJob,
+        fingerprint: Fingerprint,
+    ) -> list[str]:
+        """Reuse fingerprint HTML when available, otherwise fetch.
+
+        The fingerprint stage always fetches the homepage on a
+        reachable site, so for the overwhelming majority of domains
+        we can derive anchors from the cached HTML and skip a network
+        round-trip entirely.
+        """
+        if fingerprint.homepage_html:
+            base = fingerprint.final_url or job.url
+            out: list[str] = []
+            for href in _extract_anchor_hrefs(fingerprint.homepage_html):
+                absolute = join_url(base, href)
+                if not absolute.startswith(("http://", "https://")):
+                    continue
+                if not same_registrable_domain(absolute, job.url):
+                    continue
+                out.append(absolute)
+            return out
+        _, fresh = await harvest_homepage_links(job.url, self._fetcher)
+        return fresh
 
     async def _expand_hubs(
         self,

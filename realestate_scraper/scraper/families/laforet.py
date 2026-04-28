@@ -16,7 +16,10 @@ LAFORET = Family(
         r"/(?:acheter|louer)/[^/]+/[^/]+",
         r"/annonce[s]?/",
     ),
-    requires_dynamic=True,
+    # Detail pages serve usable static HTML; only the search results
+    # screen is JS-heavy. The pipeline still escalates to Playwright if
+    # the static path returns zero listings, so we lose no coverage.
+    requires_dynamic=False,
 )
 
 get_registry().register(LAFORET)

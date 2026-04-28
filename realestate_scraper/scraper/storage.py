@@ -126,12 +126,13 @@ class ListingWriter:
     def _register(self, listing: Listing) -> bool:
         """Decide whether to keep `listing`, recording its keys if so.
 
-        Invariant: a listing is accepted iff every dedup key it can
-        produce is unseen on the same domain. The three tiers are
-        therefore checked collectively, not in isolation - otherwise a
-        listing with a unique URL but a duplicate content fingerprint
-        would be accepted just because tier 2 had not seen its URL
-        before, defeating the purpose of tier 3.
+        Identity tiers (reference, canonical URL) reject duplicates
+        outright. The content fingerprint is a *guard*, not an
+        identity tier: it only rejects the listing when no identity
+        signal is available, so two genuinely distinct listings that
+        happen to share location + type + surface + price (e.g. two
+        identical studios in the same building) are not dropped if
+        either has a unique reference or URL.
         """
         domain = (listing.source_domain or "").strip().lower()
         if not domain:
@@ -145,11 +146,19 @@ class ListingWriter:
         url_pair = (domain, url_key) if url_key else None
         content_pair = (domain, content_key) if content_key else None
 
+        # Identity tiers: hard reject.
         if ref_pair and ref_pair in self._seen_ref:
             return False
         if url_pair and url_pair in self._seen_url:
             return False
-        if content_pair and content_pair in self._seen_content:
+
+        # Guard tier: only enforce when no identity signal is present.
+        has_identity = bool(ref_pair or url_pair)
+        if (
+            not has_identity
+            and content_pair
+            and content_pair in self._seen_content
+        ):
             return False
 
         if ref_pair:
