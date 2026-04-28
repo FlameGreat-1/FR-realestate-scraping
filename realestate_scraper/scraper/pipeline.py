@@ -49,6 +49,13 @@ from .utils.geocoder import AsyncGeocoder
 
 log = logging.getLogger(__name__)
 
+# Hard cap on the post-domain finalize step (CSV writes + checkpoint
+# flush). The same value the static and dynamic extractors use for
+# their cleanup gathers; sharing it keeps the wall-clock contract
+# (`domain_time_budget + _FINALIZE_CAP` worst case) consistent across
+# modules.
+_FINALIZE_CAP: float = 5.0
+
 
 class Pipeline:
     """Concurrent per-domain orchestrator."""
@@ -205,14 +212,23 @@ class Pipeline:
                 reason=reason,
                 strategy=Strategy.NONE,
             )
-        # Cap reported duration at the contractual budget so the
-        # summary CSV never claims a longer run than the deadline
-        # allowed. The actual wall clock can briefly exceed the
-        # deadline during cleanup; that is bounded by the extractors
-        # themselves and does not appear in the report.
-        elapsed = time.perf_counter() - start
-        result.duration_seconds = min(elapsed, budget)
-        await self._finalize(result)
+        # Wall-clock contract: the inner extractors cap their gather
+        # phases via configurable ratios; finalize is the only
+        # remaining work that could push past the budget on a slow
+        # disk. Bound it explicitly so an overrun cannot happen.
+        # `_FINALIZE_CAP` is the same conservative value the
+        # extractors use for their cleanup gathers, so the constants
+        # do not diverge across modules.
+        result.duration_seconds = time.perf_counter() - start
+        try:
+            await asyncio.wait_for(
+                self._finalize(result), timeout=_FINALIZE_CAP,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "domain %s finalize exceeded %.1fs cap, result not flushed",
+                job.domain, _FINALIZE_CAP,
+            )
 
     async def _scrape_domain(
         self,
