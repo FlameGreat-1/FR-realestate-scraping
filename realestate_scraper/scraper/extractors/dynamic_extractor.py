@@ -74,14 +74,13 @@ _NETWORK_IDLE_TIMEOUT_MS: int = 2_000
 _HOMEPAGE_RETRY_SETTLE_SECONDS: float = 0.4
 
 
-# Hard cap on concurrent Playwright escalations from detail-page
-# fetches within a single domain. Without this, a domain whose httpx
-# fetches all fail (timeout, 403, etc.) sends 120 URLs through 3
-# browser slots = 800s minimum, far exceeding any domain budget.
-# 2 slots means at most 2 detail pages render concurrently per domain,
-# leaving the remaining browser slot(s) available for other domains'
-# homepage renders and escalations.
-_MAX_DETAIL_ESCALATIONS: int = 2
+# Hard cap on TOTAL Playwright escalations from detail-page fetches
+# within a single gather_listings call. This is not a concurrency
+# limit (that's the browser pool semaphore) but a budget: once N
+# detail URLs have attempted Playwright, all further escalations
+# are skipped. This prevents a domain whose httpx fetches all fail
+# from monopolising the browser pool.
+_MAX_DETAIL_ESCALATION_BUDGET: int = 6
 
 
 class DynamicExtractor:
@@ -98,7 +97,6 @@ class DynamicExtractor:
         self._fetcher = fetcher
         self._discovery = CandidateDiscovery(settings, fetcher)
         self._listing_sem = asyncio.Semaphore(settings.listing_concurrency)
-        self._escalation_sem = asyncio.Semaphore(_MAX_DETAIL_ESCALATIONS)
 
     @property
     def is_available(self) -> bool:
@@ -125,8 +123,13 @@ class DynamicExtractor:
         seen_keys: set[str] = set()
         listing_budget = self._settings.listing_time_budget
 
+        # Mutable counter shared across all _get_html calls in this
+        # gather. Tracks total Playwright escalation attempts so we
+        # can enforce the per-domain budget without a racy semaphore.
+        escalation_count: list[int] = [0]
+
         async def _process(url: str) -> Optional[Listing]:
-            html = await self._get_html(url)
+            html = await self._get_html(url, escalation_count)
             if not html:
                 return None
             # CPU-bound parse + resolver work runs OFF the event loop.
@@ -193,36 +196,51 @@ class DynamicExtractor:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            # Give cancelled tasks one event-loop tick to process the
-            # CancelledError so their finally blocks (semaphore
-            # releases, page closes) actually execute.
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Give cancelled tasks a bounded window to process the
+            # CancelledError. Playwright's internal futures can hang
+            # indefinitely after TargetClosedError, so we cap the
+            # cleanup at 5s. Abandoned tasks' resources are reclaimed
+            # by the browser pool's context-discard logic.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                log.debug(
+                    "dynamic: cleanup gather timed out for %s, "
+                    "abandoning %d tasks",
+                    job.domain,
+                    sum(1 for t in tasks if not t.done()),
+                )
         return results
 
-    async def _get_html(self, url: str) -> str:
+    async def _get_html(
+        self, url: str, escalation_count: list[int],
+    ) -> str:
         """Try httpx first; escalate to Playwright only on hard blocks.
 
-        Escalation is gated by _escalation_sem so a domain whose httpx
-        fetches all fail cannot monopolise the browser pool. At most
-        _MAX_DETAIL_ESCALATIONS concurrent Playwright renders run per
-        domain, leaving browser slots available for other domains.
+        Escalation is gated by a per-call budget counter so a domain
+        whose httpx fetches all fail cannot monopolise the browser pool.
+        Once _MAX_DETAIL_ESCALATION_BUDGET URLs have attempted Playwright,
+        all further escalations are skipped immediately.
+
+        escalation_count is a single-element list used as a mutable
+        counter shared across all concurrent _get_html calls within
+        one gather_listings invocation. List mutation is atomic on
+        the single-threaded event loop.
         """
         async with self._listing_sem:
             outcome: FetchOutcome = await self._fetcher.fetch(url)
         if outcome.ok and outcome.is_html_like and outcome.text:
             return outcome.text
         if outcome.status is None or outcome.status in _BLOCK_STATUSES:
-            # Gate escalation: if all slots are busy, skip this URL
-            # rather than queue behind 100+ other failed fetches.
-            # The per-listing wall-clock cap would eventually kill it
-            # anyway, but waiting in the semaphore queue wastes the
-            # domain's time budget on queueing instead of scraping.
-            if self._escalation_sem.locked():
+            if escalation_count[0] >= _MAX_DETAIL_ESCALATION_BUDGET:
                 return ""
-            async with self._escalation_sem:
-                html = await self._render_with_playwright(url)
-                if html:
-                    return html
+            escalation_count[0] += 1
+            html = await self._render_with_playwright(url)
+            if html:
+                return html
         return ""
 
     async def _render_with_playwright(self, url: str) -> str:
