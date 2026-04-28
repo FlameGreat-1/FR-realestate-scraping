@@ -7,9 +7,11 @@ text.
 Sources, in order of confidence:
     1. JSON-LD `dpe` (already normalised by `utils.json_ld`).
     2. Inline `data-dpe` / `data-classe-energie` attributes.
-    3. Image `alt` attributes carrying the rating in human text.
-    4. Labelled inline text (DPE, Diagnostic, Classe énergie,
-       Étiquette énergie, Consommation, DPE collectif, ...).
+    3. CSS-class-encoded badges (`<span class="dpe dpe-c">`,
+       `<div class="etiquette-energie classe-d">`).
+    4. Image `alt` attributes carrying the rating in human text.
+    5. Labelled inline text (DPE, Diagnostic, Classe energie,
+       Etiquette energie, Consommation, DPE collectif, ...).
 
 Numeric `kWh/m².an` thresholds are intentionally not converted to
 class letters - the regulatory mapping depends on climate zone, so
@@ -59,6 +61,22 @@ _IMG_ALT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Class-name-encoded DPE badges. Matches:
+#   class="dpe dpe-c"
+#   class="etiquette-energie classe-d"
+#   class="energy-class-e"
+#   class="dpe-letter-a"
+_CLASS_ENCODED = re.compile(
+    r"(?:^|[\s\-_])(?:dpe|classe|class|letter|lettre|energy)"
+    r"[\s\-_]?([A-G])(?:[\s\-_]|$)",
+    re.IGNORECASE,
+)
+# Selector to narrow class search to plausibly-DPE-related elements.
+_CLASS_SCOPE_SELECTOR = (
+    "[class*='dpe' i], [class*='energie' i], [class*='energy' i], "
+    "[class*='etiquette' i]"
+)
+
 _LETTER_RE = re.compile(r"^[A-G]$")
 
 
@@ -81,6 +99,25 @@ def _from_data_attributes(parser: HTMLParser) -> str:
             cleaned = _clean_letter(value)
             if cleaned:
                 return cleaned
+    return ""
+
+
+def _from_class_encoded(parser: HTMLParser) -> str:
+    """Pull the DPE letter out of CSS class names on badge elements."""
+    try:
+        nodes = parser.css(_CLASS_SCOPE_SELECTOR)
+    except Exception:
+        return ""
+    for node in nodes:
+        klass = (node.attributes.get("class") or "").strip()
+        if not klass:
+            continue
+        match = _CLASS_ENCODED.search(klass)
+        if not match:
+            continue
+        cleaned = _clean_letter(match.group(1))
+        if cleaned:
+            return cleaned
     return ""
 
 
@@ -113,6 +150,7 @@ class DpeResolver:
                 if cleaned:
                     return ResolverResult(cleaned, 0.95, "json_ld")
 
+        parser: Optional[HTMLParser] = None
         if ctx.html:
             try:
                 parser = HTMLParser(ctx.html)
@@ -122,6 +160,9 @@ class DpeResolver:
                 value = _from_data_attributes(parser)
                 if value:
                     return ResolverResult(value, 0.9, "data_attr")
+                value = _from_class_encoded(parser)
+                if value:
+                    return ResolverResult(value, 0.85, "class_encoded")
                 value = _from_image_alts(parser)
                 if value:
                     return ResolverResult(value, 0.8, "img_alt")
@@ -134,6 +175,6 @@ class DpeResolver:
             if match:
                 cleaned = _clean_letter(match.group(1))
                 if cleaned:
-                    return ResolverResult(cleaned, 0.85, "label")
+                    return ResolverResult(cleaned, 0.75, "label")
 
         return ResolverResult("", 0.0, "")
