@@ -68,3 +68,20 @@ def test_location_falls_back_to_agency_csv_when_page_has_nothing():
     )
     ctx = parse_page("https://x.com/listing/12345", "<html></html>", domain_job=job)
     assert RESOLVER.resolve(ctx).value == "Toulouse 31000"
+
+
+def test_location_title_pattern_does_not_match_descriptor_runs():
+    """Numeric-laden descriptor titles must never produce a false commune."""
+    job = DomainJob(
+        domain="x.com", url="https://x.com", city="Lyon", postalcode="69001",
+    )
+    html = (
+        "<html><head><title>Appartement studio 22 75011 Paris</title>"
+        "</head><body></body></html>"
+    )
+    ctx = parse_page(
+        "https://x.com/biens/86927775", html, domain_job=job,
+    )
+    # The page genuinely names Paris 75011 - the resolver should
+    # capture that, not the descriptor run preceding it.
+    assert RESOLVER.resolve(ctx).value == "Paris"

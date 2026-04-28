@@ -43,8 +43,17 @@ _TITLE_AT_COMMUNE = re.compile(
     r"([A-ZÀ-Ý][\wÀ-ÿ' \-]{2,40}?)"
     r"(?=\s*(?:\(\d{5}\)|\b\d{5}\b|[,\-–—»]|$))",
 )
+# Commune token: capitalised word, optionally followed by up to three
+# additional capitalised tokens joined by space or hyphen. Bounded
+# alternation rather than a lazy character class with embedded
+# whitespace, so the regex engine cannot backtrack across the entire
+# title on each false start.
+_COMMUNE_TOKEN = (
+    r"[A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}"
+    r"(?:[ \-][A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}){0,3}"
+)
 _TITLE_COMMUNE_POSTAL = re.compile(
-    r"\b([A-ZÀ-Ý][\wÀ-ÿ' \-]{2,40}?)\s*\(?(\d{5})\)?\b",
+    rf"\b({_COMMUNE_TOKEN})\s*\(?(\d{{5}})\)?\b",
 )
 # Body postal scan: a 5-digit postal code immediately preceded by a
 # capitalised word (or hyphenated capitalised compound). Tight enough
