@@ -64,24 +64,19 @@ log = logging.getLogger(__name__)
 
 _BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 429})
 
-# Networkidle wait is reserved for the homepage path where JS / WAF
-# interstitials redirect to the real homepage. Detail pages return
-# clean HTML on `domcontentloaded` and the extra wait is pure cost.
-_NETWORK_IDLE_TIMEOUT_MS: int = 2_000
-# Brief settle delay between homepage render attempts. A navigation
-# race almost always resolves on the second try because the redirect
-# / challenge has had time to complete. Detail pages do NOT retry -
-# we have 119 alternatives so paying this cost there is wasteful.
-_HOMEPAGE_RETRY_SETTLE_SECONDS: float = 0.4
+# Post-domcontentloaded settle for homepage renders. Cloudflare and
+# Imperva interstitials redirect via short JS timer; 300ms is enough
+# for the redirect to fire and is far cheaper than waiting on
+# networkidle (2s every time, rarely converts).
+_HOMEPAGE_SETTLE_SECONDS: float = 0.3
 
 
 # Hard cap on TOTAL Playwright escalations from detail-page fetches
-# within a single gather_listings call. This is not a concurrency
-# limit (that's the browser pool semaphore) but a budget: once N
-# detail URLs have attempted Playwright, all further escalations
-# are skipped. This prevents a domain whose httpx fetches all fail
-# from monopolising the browser pool.
-_MAX_DETAIL_ESCALATION_BUDGET: int = 6
+# within a single gather_listings call. With 4 browser contexts and
+# 12 concurrent domains, 6/domain produced ~72 potential queued
+# borrows on the 4-slot semaphore - queue depth alone exceeded the
+# per-domain budget. 3 keeps it at ~36, drainable inside budget.
+_MAX_DETAIL_ESCALATION_BUDGET: int = 3
 
 
 class DynamicExtractor:
@@ -125,6 +120,14 @@ class DynamicExtractor:
             "dynamic: %s -> %d candidate listing URLs",
             job.domain, len(candidates),
         )
+
+        # Hard wall-clock cap on the entire candidate gather. The
+        # pipeline-level domain_time_budget is the contract, but the
+        # loop's timer wheel can be starved by chromium IPC traffic
+        # under heavy browser-pool contention; an inner cap here
+        # guarantees we hand control back regardless. 70% of the
+        # domain budget leaves headroom for finalisation.
+        gather_budget = self._settings.domain_time_budget * 0.7
 
         results: list[Listing] = []
         seen_keys: set[str] = set()
@@ -176,7 +179,8 @@ class DynamicExtractor:
         tasks = [
             asyncio.create_task(_bounded_process(url)) for url in candidates
         ]
-        try:
+
+        async def _drain() -> None:
             for coro in asyncio.as_completed(tasks):
                 try:
                     listing = await coro
@@ -194,6 +198,16 @@ class DynamicExtractor:
                     continue
                 seen_keys.add(key)
                 results.append(listing)
+
+        try:
+            try:
+                await asyncio.wait_for(_drain(), timeout=gather_budget)
+            except asyncio.TimeoutError:
+                log.info(
+                    "dynamic: %s gather budget exhausted after %.1fs, "
+                    "keeping %d listings",
+                    job.domain, gather_budget, len(results),
+                )
         finally:
             # Structured cancellation: when the domain-level wait_for
             # fires or any exception propagates, every pending task
@@ -265,26 +279,21 @@ class DynamicExtractor:
         )
 
     async def _render_homepage(self, job: DomainJob) -> tuple[str, str]:
-        """Render the homepage in Playwright with a single retry.
+        """Render the homepage in Playwright once.
 
-        Two attempts are used here (and ONLY here) because homepage
-        coverage is critical: a missed homepage means missing the
-        anchor seed for every detail page. Detail pages have 119
-        alternatives so a render miss is harmless.
-
-        Errors return empty strings; the caller falls back to the
-        fingerprint's cached HTML so a flaky Playwright launch does
-        not cost us all coverage on the domain.
+        No retry. The fingerprint module already cached the homepage
+        HTML before we got here, and `_discover_candidates` falls back
+        to it whenever this returns empty. The previous two-attempt
+        scheme paid up to one full nav_timeout per failed first
+        attempt and at 12 concurrent dynamic domains was the dominant
+        browser-pool queuing cost.
         """
-        for attempt in (1, 2):
-            html, final_url = await self._safe_render(
-                job.url, target_url=job.url,
-                wait_for_idle=True, return_final_url=True,
-            )
-            if html:
-                return html, final_url or job.url
-            if attempt == 1:
-                await asyncio.sleep(_HOMEPAGE_RETRY_SETTLE_SECONDS)
+        html, final_url = await self._safe_render(
+            job.url, target_url=job.url,
+            wait_for_idle=True, return_final_url=True,
+        )
+        if html:
+            return html, final_url or job.url
         return "", ""
 
     async def _safe_render(
@@ -318,7 +327,13 @@ class DynamicExtractor:
             the post-redirect HTML regardless of the initial status.
         """
         nav_timeout_ms = int(self._settings.browser_nav_timeout * 1000)
-        try:
+        # Total budget = pool acquire (capped at browser_nav_timeout)
+        # + nav (capped at browser_nav_timeout) + small overhead. 2x
+        # leaves room for both phases. Anything longer is the symptom
+        # we are guarding against.
+        total_budget = self._settings.browser_nav_timeout * 2
+
+        async def _do_render():
             async with self._pool.page(target_url=target_url) as page:
                 try:
                     await page.goto(
@@ -330,14 +345,11 @@ class DynamicExtractor:
                     log.debug("dynamic goto %s failed: %s", url, exc)
                     return ("", "") if return_final_url else ""
                 if wait_for_idle:
-                    # Opportunistic networkidle wait. A timeout is fine -
-                    # we proceed with whatever DOM is available.
+                    # Cheap settle for JS-redirect interstitials.
                     try:
-                        await page.wait_for_load_state(
-                            "networkidle", timeout=_NETWORK_IDLE_TIMEOUT_MS,
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
+                        await asyncio.sleep(_HOMEPAGE_SETTLE_SECONDS)
+                    except asyncio.CancelledError:
+                        raise
                 try:
                     html = await page.content()
                 except Exception as exc:  # noqa: BLE001
@@ -354,6 +366,15 @@ class DynamicExtractor:
                 if return_final_url:
                     return html or "", final_url
                 return html or ""
+
+        try:
+            return await asyncio.wait_for(_do_render(), timeout=total_budget)
+        except asyncio.TimeoutError:
+            log.debug(
+                "dynamic render %s exceeded %.1fs total budget",
+                url, total_budget,
+            )
+            return ("", "") if return_final_url else ""
         except Exception as exc:  # noqa: BLE001
             log.debug("dynamic page session %s failed: %s", url, exc)
             return ("", "") if return_final_url else ""

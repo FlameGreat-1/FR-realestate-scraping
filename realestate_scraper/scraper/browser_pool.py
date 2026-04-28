@@ -195,10 +195,26 @@ class BrowserPool:
 
     @asynccontextmanager
     async def page(self, *, target_url: str = "") -> AsyncIterator[Any]:
-        """Yield a freshly-prepared Playwright page on a pooled context."""
+        """Yield a freshly-prepared Playwright page on a pooled context.
+
+        Semaphore acquire bounded by browser_nav_timeout. When the pool
+        is contended longer than that, raise TimeoutError so the caller
+        treats it as a failed render and falls back to cached HTML
+        instead of blocking until the per-domain budget runs out.
+        """
         if not await self.start():
             raise RuntimeError("playwright not available")
-        await self._semaphore.acquire()
+        try:
+            await asyncio.wait_for(
+                self._semaphore.acquire(),
+                timeout=self._settings.browser_nav_timeout,
+            )
+        except asyncio.TimeoutError:
+            log.debug(
+                "browser pool acquire timed out after %.1fs",
+                self._settings.browser_nav_timeout,
+            )
+            raise
         context = None
         page = None
         context_healthy = True
