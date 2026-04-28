@@ -57,7 +57,7 @@ from ..http_client import FetchOutcome, HttpFetcher
 from ..models import DomainJob, Listing
 from ..utils.url import dedup_key
 from .discovery import CandidateDiscovery
-from .pipeline_extract import build_listing, parse_page
+from .pipeline_extract import parse_and_build_listing
 
 log = logging.getLogger(__name__)
 
@@ -118,11 +118,16 @@ class DynamicExtractor:
             html = await self._get_html(url)
             if not html:
                 return None
-            ctx = parse_page(url, html, domain_job=job)
-            listing = build_listing(ctx)
-            if not listing.is_publishable():
-                return None
-            return listing
+            # CPU-bound parse + resolver work runs OFF the event loop.
+            # selectolax and the regex engine do NOT yield to asyncio,
+            # so calling this synchronously here would freeze every
+            # other domain coroutine until the call returned. The
+            # to_thread handoff lets `asyncio.wait_for` actually
+            # fire on the listing_time_budget and lets other
+            # coroutines progress while CPU work is in flight.
+            return await asyncio.to_thread(
+                parse_and_build_listing, url, html, job,
+            )
 
         async def _bounded_process(url: str) -> Optional[Listing]:
             """Per-listing wall-clock guard.
