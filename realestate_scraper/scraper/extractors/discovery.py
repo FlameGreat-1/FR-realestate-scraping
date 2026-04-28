@@ -43,6 +43,7 @@ from ..utils.url import (
     ensure_scheme,
     join_url,
     parse_host,
+    parse_registrable_domain,
     same_registrable_domain,
 )
 
@@ -199,7 +200,17 @@ class CandidateDiscovery:
         if not index_paths:
             return []
 
-        base = ensure_scheme(job.url)
+        # Resolve the index path against the registrable domain so
+        # the fan-out works regardless of whether the input host is
+        # the root (`stephaneplazaimmobilier.com`) or a branch
+        # sub-domain (`bordeaux.stephaneplazaimmobilier.com`). The
+        # franchise agency index always lives on the root host.
+        registrable = parse_registrable_domain(job.url)
+        base = (
+            f"https://{registrable}/"
+            if registrable
+            else ensure_scheme(job.url)
+        )
         if not base:
             return []
 
