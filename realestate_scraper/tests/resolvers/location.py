@@ -26,5 +26,5 @@ def test_location_falls_back_to_agency_csv():
     job = DomainJob(
         domain="x.com", url="https://x.com", city="Toulouse", postalcode="31000"
     )
-    ctx = parse_page("https://x.com/page", "<html></html>", domain_job=job)
+    ctx = parse_page("https://x.com/listing/12345", "<html></html>", domain_job=job)
     assert RESOLVER.resolve(ctx).value == "Toulouse 31000"

@@ -45,7 +45,7 @@ _STRONG_DYNAMIC_MARKERS = (
 # carousel widget on an otherwise-static site.
 _WEAK_DYNAMIC_MARKERS = (
     re.compile(r"<noscript[^>]*>\s*(?:you|enable javascript)", re.IGNORECASE),
-    re.compile(r"id=\"app\"[^>]*></div>", re.IGNORECASE),
+    re.compile(r"id=[\"']app[\"'][^>]*></div>", re.IGNORECASE),
 )
 
 _BODY_PRESENCE = re.compile(r"<body[^>]*>(.{200,})</body>", re.IGNORECASE | re.DOTALL)

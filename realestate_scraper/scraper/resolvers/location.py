@@ -102,6 +102,17 @@ _NAV_LABELS: frozenset[str] = frozenset({
     "selection", "selections",
     "nos biens", "nos selections", "nos exclusivites", "nos coups",
     "best of", "top", "top biens",
+    # Round 5 additions: rental / programme / CTA labels surfaced by
+    # the consolidated-output audit.
+    "vacances", "location vacances", "location saisonniere",
+    "neuf", "programme", "programmes", "programme neuf", "programmes neufs",
+    "dispositif", "dispositifs", "aide", "aides",
+    "investir", "investissement", "defiscalisation",
+    "estimez", "evaluez", "evaluer", "estimez votre bien",
+    "vendre mon bien", "louer mon bien",
+    "chambres", "chambre", "pieces", "piece",
+    "neuve", "neuves", "neufs",
+    "sale", "house", "for sale",
 })
 
 # Property-type tokens we want to filter out of URL-derived slugs.
@@ -162,6 +173,21 @@ def _looks_place_like(value: str) -> bool:
         return False
     digit_ratio = sum(ch.isdigit() for ch in cleaned) / max(1, len(cleaned))
     if digit_ratio > 0.5:
+        return False
+    # Word-level decomposition: if every alphabetic word in the
+    # candidate is a known nav label or property-type token, the
+    # composite is a category phrase ("Location vacances appartement",
+    # "Recherche appartement"), not a place name.
+    alpha_words = [w for w in re.split(r"[\s\-]+", cleaned) if re.match(r"[A-Za-z\u00c0-\u017f]", w)]
+    if alpha_words and all(
+        normalize_for_match(w) in _NAV_LABELS or normalize_for_match(w) in _PROPERTY_TOKENS
+        for w in alpha_words
+    ):
+        return False
+    # Real French locations are at most 4-5 words (e.g. "Saint-Germain-
+    # en-Laye 78100"). Strings with > 6 words are page titles or
+    # descriptions that slipped past the nav-label check.
+    if len(alpha_words) > 6:
         return False
     return True
 
@@ -263,6 +289,10 @@ def _from_url_slug(url: str) -> str:
     we never guess a city out of an arbitrary slug.
     """
     if not url:
+        return ""
+    # URL-encoded query-like paths (`sale+house+ares+86927775`) are
+    # search parameters, not location slugs.
+    if "+" in url.split("?", 1)[0]:
         return ""
     parsed = urlparse(url)
     raw_path = parsed.path or ""

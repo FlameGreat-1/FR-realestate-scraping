@@ -19,7 +19,7 @@ def test_agent_name_falls_back_to_csv():
         url="https://x.com",
         agent_name="Patrimoine Rh",
     )
-    ctx = parse_page("https://x.com/x", "<html></html>", domain_job=job)
+    ctx = parse_page("https://x.com/listing/12345", "<html></html>", domain_job=job)
     assert RESOLVER.resolve(ctx).value == "Patrimoine Rh"
 
 

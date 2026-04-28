@@ -43,10 +43,10 @@ def _normalise(raw: str) -> str:
         return ""
     if text.startswith("+33"):
         local = digits[2:] if digits.startswith("33") else digits
-        return f"0{local}" if len(local) == 9 else digits
+        return f"0{local}" if len(local) == 9 else ""
     if text.startswith("0033") or digits.startswith("0033"):
         local = digits[4:]
-        return f"0{local}" if len(local) == 9 else digits
+        return f"0{local}" if len(local) == 9 else ""
     if digits.startswith("33") and len(digits) == 11:
         return f"0{digits[2:]}"
     if digits.startswith("00"):
@@ -55,6 +55,10 @@ def _normalise(raw: str) -> str:
         return ""
     if len(digits) == 9 and not digits.startswith("0"):
         return f"0{digits}"
+    # French numbers are exactly 10 digits. Anything longer is two
+    # numbers concatenated by an over-greedy regex capture.
+    if len(digits) > 10:
+        return ""
     return digits
 
 

@@ -174,6 +174,11 @@ def _from_slug(url: str) -> str:
         return ""
     last = path.split("/")[-1]
 
+    # URL-encoded query-like paths (`sale+house+ares+86927775`) are
+    # search parameters, not listing references.
+    if "+" in last:
+        return ""
+
     # Comma-suffix path: validate BOTH the stem and the tail.
     if "," in last:
         stem, _, tail = last.rpartition(",")

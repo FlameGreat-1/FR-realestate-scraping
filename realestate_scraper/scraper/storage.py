@@ -152,10 +152,14 @@ class ListingWriter:
         if url_pair and url_pair in self._seen_url:
             return False
 
-        # Guard tier: only enforce when no identity signal is present.
-        has_identity = bool(ref_pair or url_pair)
+        # Guard tier: collapse listings with identical descriptors even
+        # when their URLs differ (UTM params, pagination artifacts,
+        # language variants). Skip only when a reference_id is present,
+        # since that is the strongest identity signal - two genuinely
+        # distinct listings (e.g. identical studios in the same building)
+        # will each carry a unique reference.
         if (
-            not has_identity
+            not ref_pair
             and content_pair
             and content_pair in self._seen_content
         ):

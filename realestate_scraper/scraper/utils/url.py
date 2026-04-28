@@ -55,12 +55,12 @@ def same_registrable_domain(a: str, b: str) -> bool:
 
 
 def canonicalize(url: str) -> str:
-    """Drop fragment, normalise scheme/host casing, strip trailing slash."""
+    """Drop fragment, normalise scheme/host casing, strip www. prefix and trailing slash."""
     if not url:
         return ""
     parsed = urlparse(ensure_scheme(url))
     scheme = (parsed.scheme or "https").lower()
-    netloc = parsed.netloc.lower()
+    netloc = parsed.netloc.lower().removeprefix("www.")
     path = parsed.path or "/"
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
@@ -68,7 +68,30 @@ def canonicalize(url: str) -> str:
 
 
 def dedup_key(url: str) -> str:
-    return canonicalize(url).lower()
+    """Canonical key for deduplication.
+
+    Strips www., trailing slash, fragment, AND common language path
+    prefixes (/en/, /fr/, /de/, /es/, /it/) so that the same listing
+    served at both ``/fr/property/X`` and ``/en/property/X`` collapses
+    to a single key.
+    """
+    key = canonicalize(url).lower()
+    if not key:
+        return key
+    # Strip language prefix from path component.
+    for prefix in ("/en/", "/fr/", "/de/", "/es/", "/it/"):
+        idx = key.find(prefix)
+        if idx != -1:
+            # Only strip if the prefix is at the path start (right after host).
+            # Find the scheme+host portion to locate path start.
+            after_scheme = key.find("://")
+            if after_scheme == -1:
+                break
+            host_end = key.find("/", after_scheme + 3)
+            if host_end != -1 and idx == host_end:
+                key = key[:host_end] + key[host_end + len(prefix) - 1:]
+                break
+    return key
 
 
 def join_url(base: str, href: Optional[str]) -> str:

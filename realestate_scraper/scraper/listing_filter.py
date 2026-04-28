@@ -41,6 +41,15 @@ _NON_LISTING_TERMS = (
     "politique", "estimation", "estimer", "vendre-nous",
     "recrutement", "emploi", "carriere", "agences", "agence",
     "cookies", "newsletter",
+    # CTA / tool pages: never contain individual listing data.
+    "estimez-votre-bien", "estimer-mon-bien", "evaluer-mon-bien",
+    "vendre-mon-bien", "louer-mon-bien", "mettre-en-location",
+    "mettre-en-vente", "deposer-une-annonce", "prendre-rendez-vous",
+    # Rental / vacation categories: this brief is for sale listings.
+    "location-vacances", "location-saisonniere",
+    # Programme neuf / investment pages
+    "programme-neuf", "programmes-neufs", "defiscalisation",
+    "dispositif", "dispositifs",
 )
 
 _HUB_PATHS = {
@@ -48,6 +57,8 @@ _HUB_PATHS = {
     "/results", "/buy", "/listing-categorie", "/produits/all",
     "/biens/result", "/resultat.php", "/annonces", "/biens",
     "/proprietes", "/properties",
+    # Listing index pages that slipped through as detail pages.
+    "/fr/ventes", "/fr/locations", "/ventes", "/locations",
 }
 
 _HUB_PATTERNS = re.compile(
@@ -55,7 +66,8 @@ _HUB_PATTERNS = re.compile(
     r"prix-rues|/search(?:/|$)|/recherche(?:/|$)|/result(?:/|$)|"
     r"/results(?:/|$)|/biens/result|/produits/all|"
     r"^/annonces/?$|^/annonce/?$|"
-    r"^/proprietes/?$|^/properties/?$)",
+    r"^/proprietes/?$|^/properties/?$|"
+    r"listing-vente\.html|listing-location\.html)",
     re.IGNORECASE,
 )
 

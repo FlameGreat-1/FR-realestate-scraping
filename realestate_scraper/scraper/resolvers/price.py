@@ -232,6 +232,24 @@ class PriceResolver:
     name = "price"
 
     def resolve(self, ctx: PageContext) -> ResolverResult:
+        # URL-level rental guard: when the listing URL itself contains
+        # strong rental markers, we skip extraction entirely. The
+        # existing _RENT_CONTEXT guard operates on text windows around
+        # individual price amounts and cannot catch DPE/diagnostic
+        # numbers located in unrelated sections of rental pages.
+        if ctx.url:
+            url_lower = ctx.url.lower()
+            url_path = url_lower.split("?", 1)[0]
+            if any(marker in url_path for marker in (
+                "/location/", "/locations/", "/louer/",
+                "-mois", "/mois", "location-vacances",
+                "location-saisonniere",
+            )):
+                return ResolverResult("", 0.0, "")
+            # Cosialis-class slug: `…-580e-mois`, `…-657e-mois`
+            if re.search(r"\d+e[/-]mois", url_path):
+                return ResolverResult("", 0.0, "")
+
         # 1. JSON-LD
         ld_price = ctx.json_ld.get("price") if ctx.json_ld else None
         if ld_price:
