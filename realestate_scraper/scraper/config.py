@@ -37,7 +37,7 @@ class Settings(BaseSettings):
 
     # --- Concurrency ---
     domain_concurrency: int = Field(default=12, ge=1, le=256)
-    per_host_concurrency: int = Field(default=4, ge=1, le=64)
+    per_host_concurrency: int = Field(default=6, ge=1, le=64)
     listing_concurrency: int = Field(default=24, ge=1, le=256)
     browser_concurrency: int = Field(default=4, ge=1, le=32)
 
@@ -53,7 +53,13 @@ class Settings(BaseSettings):
     browser_nav_timeout: float = Field(default=15.0, gt=0)
 
     # --- Limits ---
-    max_listing_urls_per_domain: int = Field(default=120, ge=1)
+    # 40 candidates is the sweet spot: 40 / 6 per-host * 10s fetch =
+    # 67s worst case, fitting comfortably in the 120s domain budget.
+    # The ranking in discovery.rank_and_limit already puts the highest-
+    # scoring URLs first, so 40 captures the best candidates. At 55k+
+    # scale, processing fewer high-quality URLs per domain is faster
+    # and produces better data than attempting 120 and timing out.
+    max_listing_urls_per_domain: int = Field(default=40, ge=1)
     max_seed_urls_per_domain: int = Field(default=80, ge=1)
     max_sitemap_depth: int = Field(default=2, ge=1, le=5)
     seed_expansion_depth: int = Field(default=2, ge=0, le=4)
