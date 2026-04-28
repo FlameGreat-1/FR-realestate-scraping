@@ -65,7 +65,7 @@ log = logging.getLogger(__name__)
 _BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 429})
 
 
-def _consume_orphan_exception(task: asyncio.Task) -> None:
+def consume_orphan_exception(task: asyncio.Task) -> None:
     """Done-callback that retrieves an abandoned task's exception.
 
     Called only on tasks that the cleanup gather abandoned because
@@ -73,6 +73,9 @@ def _consume_orphan_exception(task: asyncio.Task) -> None:
     the exception (and discarding it) marks the future as retrieved
     so the asyncio garbage collector does not emit the cosmetic
     `Future exception was never retrieved` warning.
+
+    Shared between the static and dynamic extractors; the symbol
+    is module-public so the cross-module import is intentional.
     """
     if task.cancelled():
         return
@@ -264,7 +267,7 @@ class DynamicExtractor:
                 # warning does not fire.
                 pending = [t for t in tasks if not t.done()]
                 for task in pending:
-                    task.add_done_callback(_consume_orphan_exception)
+                    task.add_done_callback(consume_orphan_exception)
                 log.debug(
                     "dynamic: cleanup gather timed out for %s, "
                     "abandoning %d tasks",
