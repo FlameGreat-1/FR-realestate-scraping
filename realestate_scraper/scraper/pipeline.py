@@ -576,3 +576,9 @@ async def run_pipeline(
     # Geocoder post-pass: runs ONCE after every domain has finished,
     # on a single coroutine. Never on the per-domain hot path.
     await pipeline.run_geocode_post_pass()
+
+    # Human-readable summary derived from the three output CSVs.
+    # Purely informational; failures are logged and swallowed so
+    # they cannot mask a successful run.
+    from .report import generate_report
+    generate_report(settings)
