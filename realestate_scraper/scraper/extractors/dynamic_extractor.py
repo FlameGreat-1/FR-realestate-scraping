@@ -125,9 +125,13 @@ class DynamicExtractor:
         # pipeline-level domain_time_budget is the contract, but the
         # loop's timer wheel can be starved by chromium IPC traffic
         # under heavy browser-pool contention; an inner cap here
-        # guarantees we hand control back regardless. 70% of the
-        # domain budget leaves headroom for finalisation.
-        gather_budget = self._settings.domain_time_budget * 0.7
+        # guarantees we hand control back regardless. The ratio is
+        # configurable so operators can rebalance against the static
+        # ratio when tuning a large corpus.
+        gather_budget = (
+            self._settings.domain_time_budget
+            * self._settings.dynamic_gather_budget_ratio
+        )
 
         results: list[Listing] = []
         seen_keys: set[str] = set()

@@ -70,12 +70,17 @@ class StaticExtractor:
         )
 
         # Hard wall-clock cap on the entire candidate gather. Mirrors
-        # the dynamic extractor's outer cap (MR !21). Without this the
-        # static path can run uncapped on slow Cloudflare-fronted hosts
-        # whose httpx fetches all hit fetch_timeout, generating enough
-        # loop traffic to starve the pipeline-level wait_for(120s).
-        # Sized to 70% of domain budget to leave finalisation headroom.
-        gather_budget = self._settings.domain_time_budget * 0.7
+        # the dynamic extractor's outer cap. Without this the static
+        # path can run uncapped on slow Cloudflare-fronted hosts whose
+        # httpx fetches all hit fetch_timeout, generating enough loop
+        # traffic to starve the pipeline-level wait_for. The ratio is
+        # configurable so operators can rebalance against the dynamic
+        # ratio when tuning a large corpus; default 0.55 leaves room
+        # for the hybrid fallback to engage on zero-listing static.
+        gather_budget = (
+            self._settings.domain_time_budget
+            * self._settings.static_gather_budget_ratio
+        )
 
         results: list[Listing] = []
         seen_keys: set[str] = set()
