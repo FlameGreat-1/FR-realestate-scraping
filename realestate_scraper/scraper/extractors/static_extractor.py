@@ -27,6 +27,7 @@ from ..http_client import HttpFetcher
 from ..models import DomainJob, Listing
 from ..utils.url import dedup_key
 from .discovery import CandidateDiscovery
+from .dynamic_extractor import _consume_orphan_exception
 from .pipeline_extract import parse_and_build_listing
 
 log = logging.getLogger(__name__)
@@ -174,10 +175,12 @@ class StaticExtractor:
                     timeout=5.0,
                 )
             except asyncio.TimeoutError:
+                pending = [t for t in tasks if not t.done()]
+                for task in pending:
+                    task.add_done_callback(_consume_orphan_exception)
                 log.debug(
                     "static: cleanup gather timed out for %s, "
                     "abandoning %d tasks",
-                    job.domain,
-                    sum(1 for t in tasks if not t.done()),
+                    job.domain, len(pending),
                 )
         return results
