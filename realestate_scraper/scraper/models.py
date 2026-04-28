@@ -47,13 +47,22 @@ ERROR_FIELDS: tuple[str, ...] = ("domain", "status", "reason")
 # `/biens/contactville/123` does not collide with the `contact`
 # segment. The match is case-insensitive at lookup time.
 _NON_LISTING_URL_SEGMENTS: frozenset[str] = frozenset({
-    "i", "redac", "honoraires", "mentions", "mentions-legales",
+    "honoraires", "mentions", "mentions-legales",
     "cookies", "privacy", "cgu", "cgv", "legal",
     "contact", "equipe", "team",
     "agences", "actualites",
     "blog", "article", "articles", "news",
     "page", "pages",
 })
+
+# Compound paths that can only be recognised by their multi-segment
+# shape. `/i/redac/...` is the agencemathieu.fr CMS internal-page
+# prefix. Each entry is matched as a substring of the full URL path
+# (already lower-cased) because the segment-by-segment check would
+# require either entry to be a single segment.
+_NON_LISTING_URL_COMPOUNDS: tuple[str, ...] = (
+    "/i/redac/",
+)
 
 DOMAIN_SUMMARY_FIELDS: tuple[str, ...] = (
     "domain",
@@ -166,10 +175,13 @@ class Listing:
         # CMS / informational page guard: reject before counting
         # informative fields so a page with a fee amount + agency
         # metadata cannot leak through the price-anchor branch.
-        # Slash-bounded segment match: a path like `/contactville/`
-        # is NOT rejected by the `contact` entry.
+        # Slash-bounded segment match for plain names; substring
+        # match for compound CMS-prefix shapes like `/i/redac/`.
         url_path = (self.source_url or "").lower().split("?", 1)[0]
         if url_path:
+            for compound in _NON_LISTING_URL_COMPOUNDS:
+                if compound in url_path:
+                    return False
             segments = [seg for seg in url_path.split("/") if seg]
             for segment in segments:
                 if segment in _NON_LISTING_URL_SEGMENTS:
