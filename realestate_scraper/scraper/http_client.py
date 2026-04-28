@@ -276,13 +276,21 @@ class HttpFetcher:
         )
 
         if host:
-            if outcome.ok and outcome.is_html_like:
-                self._block_tracker.record_ok(host)
-            else:
-                # Any non-OK result counts: explicit block status,
-                # network error (status=None), non-HTML content, or
-                # 5xx. Three of those in a row means we stop.
+            # Tracker increments ONLY on explicit hard blocks. Network
+            # timeouts, non-HTML responses, 404s and 5xx are NOT block
+            # signals - they are normal-traffic outcomes that real
+            # detail-page lists produce in clusters of 3+ all the time
+            # (stale sitemap URLs, PDF brochures, JSON micro-endpoints,
+            # transient backend flap). Counting them as blocks (MR !25
+            # original implementation) blacklisted working hosts
+            # mid-run and broke previously-passing domains.
+            if outcome.status in _BLOCK_STATUSES:
                 self._block_tracker.record_block(host)
+            elif outcome.ok:
+                self._block_tracker.record_ok(host)
+            # Any other outcome (network error, non-HTML, 404, 5xx)
+            # leaves the counter untouched: not a confirmed block, not
+            # a confirmed success.
         return outcome
 
     async def _fetch_with_headers(
