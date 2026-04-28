@@ -236,19 +236,24 @@ class HttpFetcher:
         url: str,
         *,
         timeout: Optional[float] = None,
-        retry_on_block: bool = True,
+        retry_on_block: bool = True,  # kept for ABI; ignored
     ) -> FetchOutcome:
-        """GET `url` with transient-error retries and optional UA rotation.
-
-        On a 401/403/429 response we retry exactly once with a rotated
-        UA profile before returning the (still-blocked) outcome.
+        """GET `url` once and update the per-host block tracker.
 
         Per-host fast-fail: once a host has produced
-        _HOST_BLOCK_THRESHOLD consecutive 401/403/429 responses, every
-        subsequent fetch on that host returns a synthetic 403 without
-        touching the network. This prevents the static path from
-        wasting the per-domain wall-clock on hosts that have made it
-        clear they are not going to answer httpx.
+        _HOST_BLOCK_THRESHOLD consecutive non-OK responses (any of:
+        401/403/429, network error, connect timeout, read timeout),
+        every subsequent fetch on that host returns a synthetic 403
+        without touching the network. Resets on any successful
+        response.
+
+        The previous per-fetch UA-rotation retry on 403/429 is
+        removed: at threshold=3 it just doubled the wait per
+        blocked URL (40 URLs * 10s * 2 attempts = 133s wasted on a
+        fully-blocked host) without producing successes. The dynamic
+        extractor's Playwright escalation path is the correct
+        recovery for hard blocks; this fetcher's job is to fail
+        fast and let the caller decide.
         """
         if not url:
             return FetchOutcome(
@@ -269,33 +274,14 @@ class HttpFetcher:
             headers=self.headers_for(url),
             timeout=timeout,
         )
-        if (
-            retry_on_block
-            and outcome.status in _BLOCK_STATUSES
-        ):
-            rotated = self.headers_for(url, attempt=1)
-            retried = await self._fetch_with_headers(
-                url,
-                headers=rotated,
-                timeout=timeout,
-            )
-            if retried.ok:
-                if host:
-                    self._block_tracker.record_ok(host)
-                return retried
-            if (
-                retried.status is not None
-                and retried.status not in _BLOCK_STATUSES
-            ):
-                if host:
-                    self._block_tracker.record_ok(host)
-                return retried
-            outcome = retried
 
         if host:
-            if outcome.ok:
+            if outcome.ok and outcome.is_html_like:
                 self._block_tracker.record_ok(host)
-            elif outcome.status in _BLOCK_STATUSES:
+            else:
+                # Any non-OK result counts: explicit block status,
+                # network error (status=None), non-HTML content, or
+                # 5xx. Three of those in a row means we stop.
                 self._block_tracker.record_block(host)
         return outcome
 
