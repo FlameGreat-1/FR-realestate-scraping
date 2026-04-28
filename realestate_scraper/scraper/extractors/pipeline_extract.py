@@ -8,6 +8,10 @@ one field never prevents the others (see `_safe_resolve`).
 from __future__ import annotations
 
 import logging
+import signal
+import threading
+from contextlib import contextmanager
+from typing import Iterator, Optional
 
 from selectolax.parser import HTMLParser
 
@@ -29,6 +33,68 @@ from ..utils.text import collapse_whitespace
 from ..utils.url import canonicalize, parse_registrable_domain
 
 log = logging.getLogger(__name__)
+
+
+class _ParseTimeout(Exception):
+    """Raised by the SIGALRM handler when synchronous parse work
+    exceeds its wall-clock budget.
+
+    Caught inside `parse_and_build_listing` and translated into a
+    `None` return value, which the extractors already treat as a
+    dropped listing. Never propagates to the caller.
+    """
+
+
+@contextmanager
+def _parse_time_guard(budget: Optional[float]) -> Iterator[None]:
+    """Bound synchronous parse work to `budget` seconds when possible.
+
+    SIGALRM is the only mechanism that can interrupt CPython code
+    mid-execution (regex backtracking, selectolax C extension work),
+    but Python only delivers signals on the main thread. When this
+    runs in a parse-pool worker (the hot path) the guard is a no-op,
+    and we rely on the regex shape fixes plus the per-listing
+    asyncio.wait_for in the extractors.
+
+    When called from the main thread (tests, ad-hoc scripts) the
+    guard is armed: a SIGALRM after `budget` seconds raises
+    `_ParseTimeout`, which `parse_and_build_listing` catches and
+    converts into a dropped listing.
+
+    Always yields - never blocks the caller. The handler and any
+    pending alarm are cleared in a finally block, so a guard armed
+    on one call cannot leak into the next.
+    """
+    if (
+        budget is None
+        or budget <= 0
+        or threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "SIGALRM")
+    ):
+        yield
+        return
+
+    def _handler(signum, frame):  # type: ignore[no-untyped-def]
+        raise _ParseTimeout("parse budget exceeded")
+
+    # signal.setitimer accepts sub-second resolution; signal.alarm only
+    # accepts whole seconds. Prefer setitimer when available so a 1.5s
+    # budget is honoured precisely.
+    previous = signal.signal(signal.SIGALRM, _handler)
+    use_itimer = hasattr(signal, "setitimer")
+    try:
+        if use_itimer:
+            signal.setitimer(signal.ITIMER_REAL, budget)
+        else:
+            # Round up so we never under-cap the budget.
+            signal.alarm(max(1, int(budget + 0.999)))
+        yield
+    finally:
+        if use_itimer:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        else:
+            signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 _PRICE = PriceResolver()
@@ -155,29 +221,40 @@ def parse_and_build_listing(
     url: str,
     html: str,
     domain_job: DomainJob | None = None,
+    *,
+    time_budget: Optional[float] = None,
 ) -> Listing | None:
     """Synchronous combined entry point for parse + build_listing.
 
     Returns the Listing when publishable, None otherwise. Designed to
-    be invoked through `asyncio.to_thread` so the synchronous
-    selectolax / regex / resolver work runs OFF the event loop.
-    Running this work on the loop directly is the architectural
-    defect that froze the pipeline up through Round 8 - the
-    selectolax C extension and regex engine do not yield to asyncio,
-    so per-listing wall-clock guards (asyncio.wait_for) cannot
-    interrupt them.
+    be invoked through `asyncio.to_thread` / `run_in_executor` so the
+    synchronous selectolax / regex / resolver work runs OFF the event
+    loop. Running this work on the loop directly is the architectural
+    defect that froze the pipeline up through Round 8 - the selectolax
+    C extension and regex engine do not yield to asyncio, so per-
+    listing wall-clock guards (asyncio.wait_for) cannot interrupt them.
 
-    Why a combined helper rather than two `to_thread` calls:
-        * Each `to_thread` round-trip costs an executor handoff. One
-          handoff per listing is cheap; two doubles it.
-        * Crashes inside `parse_page` (e.g. selectolax raising on
-          malformed HTML) are now contained the same way resolver
-          crashes are: a try/except returns None and the caller
-          drops the listing without aborting the gather.
+    `time_budget`: optional wall-clock cap, in seconds, for the
+    synchronous work. When the call runs on the main thread and
+    SIGALRM is available (POSIX), exceeding the budget raises
+    `_ParseTimeout` internally and the function returns None. On
+    parse-pool worker threads the guard is a no-op (signals are
+    main-thread only); the regex-shape fixes are the primary defence
+    on that path, with the asyncio.wait_for in the extractors as the
+    structural cancellation boundary.
+
+    Why a combined helper rather than two to_thread calls:
+        * Each to_thread round-trip costs an executor handoff.
+        * Crashes inside parse_page (selectolax raising on malformed
+          HTML) are contained the same way resolver crashes are.
     """
     try:
-        ctx = parse_page(url, html, domain_job=domain_job)
-        listing = build_listing(ctx)
+        with _parse_time_guard(time_budget):
+            ctx = parse_page(url, html, domain_job=domain_job)
+            listing = build_listing(ctx)
+    except _ParseTimeout:
+        log.debug("parse_and_build_listing time budget exceeded for %s", url)
+        return None
     except Exception as exc:  # noqa: BLE001
         log.debug("parse_and_build_listing failed for %s: %s", url, exc)
         return None

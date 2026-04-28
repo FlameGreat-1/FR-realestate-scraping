@@ -41,25 +41,31 @@ _URL_LOCATION = re.compile(
     r"|(?:^|[/\-])(\d{5})-([a-z][a-z0-9\-]{2,})(?:[/,?\-]|$)",
     re.IGNORECASE,
 )
+# Commune token: capitalised word, optionally followed by up to three
+# additional capitalised tokens joined by space or hyphen. Bounded
+# alternation over a class that does NOT contain the separator, so
+# the regex engine cannot backtrack across the entire input on each
+# false start. Shared by every commune-shaped pattern below so any
+# future tweak applies uniformly.
+_COMMUNE_TOKEN = (
+    r"[A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}"
+    r"(?:[ \-][A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}){0,3}"
+)
 # Page-title / h1 patterns. We capture the rightmost commune token
 # anchored on any of:
 #   `à <Commune>` / `a <Commune>` / `au <Commune>` / `at <Commune>`
 #   `<Commune> (<postal>)`
 #   `<Commune> <postal>`
-#   `<text>, <Commune>` (only when the comma-tail looks place-shaped)
+#
+# Prepositional anchor reuses `_COMMUNE_TOKEN` instead of an embedded-
+# space character class with a lazy quantifier. The previous shape
+# (`[\wÀ-ÿ' \-]{2,40}?`) included a literal space inside the class,
+# which combined with the lazy `{2,40}?` and a broad trailing
+# lookahead produced exponential backtracking on long titles with no
+# 5-digit anchor. The fixed-shape NFA below caps backtracking depth
+# at O(token_count) regardless of input length.
 _TITLE_AT_COMMUNE = re.compile(
-    r"(?:[\s»])(?:à|a|au|aux|at)\s+"
-    r"([A-ZÀ-Ý][\wÀ-ÿ' \-]{2,40}?)"
-    r"(?=\s*(?:\(\d{5}\)|\b\d{5}\b|[,\-–—»]|$))",
-)
-# Commune token: capitalised word, optionally followed by up to three
-# additional capitalised tokens joined by space or hyphen. Bounded
-# alternation rather than a lazy character class with embedded
-# whitespace, so the regex engine cannot backtrack across the entire
-# title on each false start.
-_COMMUNE_TOKEN = (
-    r"[A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}"
-    r"(?:[ \-][A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}){0,3}"
+    rf"(?:[\s»])(?:à|a|au|aux|at)\s+({_COMMUNE_TOKEN})",
 )
 _TITLE_COMMUNE_POSTAL = re.compile(
     rf"\b({_COMMUNE_TOKEN})\s*\(?(\d{{5}})\)?\b",
@@ -72,13 +78,19 @@ _TITLE_POSTAL_COMMUNE = re.compile(
     rf"\b(\d{{5}})\s+({_COMMUNE_TOKEN})\b",
 )
 # Body postal scan: a 5-digit postal code immediately preceded by a
-# capitalised word (or hyphenated capitalised compound). Tight enough
-# to not match unrelated numeric runs and city-less postal lists.
+# commune token. Reuses `_COMMUNE_TOKEN` so the inner character class
+# never contains the separator - bounded backtracking instead of the
+# O(n * 4^k) explosion of the previous shape.
 _BODY_COMMUNE_POSTAL = re.compile(
-    r"\b([A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}"
-    r"(?:[\- ][A-ZÀ-Ý][\wÀ-ÿ'\-]{1,30}){0,3})"
-    r"\s+(\d{5})\b",
+    rf"\b({_COMMUNE_TOKEN})\s+(\d{{5}})\b",
 )
+# Hard cap on the body slice fed to the postal scan. The address
+# block on every CMS template we observe renders within the first
+# few KB of body text (header, hero, contact panel, breadcrumb).
+# Capping protects against any future regex regression and saves
+# the engine from scanning footers / legal-mentions / FAQ blocks
+# that never contain the address.
+_BODY_POSTAL_SCAN_CAP: int = 32_768
 _BREADCRUMB_SELECTOR = (
     ".breadcrumb, .breadcrumbs, nav.breadcrumb, ol.breadcrumb, ul.breadcrumb, "
     "[itemtype*='BreadcrumbList'], [class*='breadcrumb' i], [class*='chemin' i]"
@@ -371,9 +383,17 @@ def _from_body_postal(text: str) -> str:
     The pattern is anchored on the postal code (always exactly five
     digits in France), so unrelated numeric runs cannot match. The
     leading capitalised word(s) are validated through the shape gate.
+
+    Input is capped at `_BODY_POSTAL_SCAN_CAP` characters. The address
+    block always renders near the top of agency detail pages; scanning
+    the full body (often 50-500 KB on franchise templates) only adds
+    cost on legal-mention / FAQ / footer regions that never contain a
+    postal-anchored address.
     """
     if not text:
         return ""
+    if len(text) > _BODY_POSTAL_SCAN_CAP:
+        text = text[:_BODY_POSTAL_SCAN_CAP]
     match = _BODY_COMMUNE_POSTAL.search(text)
     if not match:
         return ""
