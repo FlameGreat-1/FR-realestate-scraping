@@ -68,7 +68,15 @@ class Settings(BaseSettings):
     )
     accept_language: str = Field(default="fr-FR,fr;q=0.9,en;q=0.7")
     enable_playwright: bool = Field(default=True)
-    enable_geocoding: bool = Field(default=False)
+    # Geocoding fills `coordinates` for listings whose pages do not
+    # ship lat/lng in any in-page form (no JSON-LD geo, no
+    # `data-lat`/`data-lng`, no map iframe). The pipeline already
+    # caches results to disk and serialises calls at 1 req/s to
+    # respect Nominatim's policy. At 50-domain scale the wall-clock
+    # cost is dominated by the cache; at 55k+ scale the operator can
+    # flip this off via the `ENABLE_GEOCODING` environment variable
+    # if a managed-quota geocoder is preferred.
+    enable_geocoding: bool = Field(default=True)
     geocoder_user_agent: str = Field(default="realestate_scraper/1.0")
     geocoder_timeout: float = Field(default=3.0, gt=0)
 
