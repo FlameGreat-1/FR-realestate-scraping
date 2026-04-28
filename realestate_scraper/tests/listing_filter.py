@@ -41,3 +41,18 @@ def test_accepts_real_detail_urls():
 def test_shallow_paths_with_no_signal_rejected():
     assert classify_url(f"{_HOST}/about-us").score <= 0
     assert classify_url(f"{_HOST}/team").score <= 0
+
+
+def test_reference_shape_outranks_category_hub():
+    """A reference-shape detail URL must rank strictly above a category page."""
+    detail = classify_url(
+        f"{_HOST}/vente/maison-bordeaux-33000-ref-39416895"
+    )
+    hub = classify_url(f"{_HOST}/biens/maisons-vente")
+    assert detail.score > hub.score, (detail, hub)
+
+
+def test_bare_hub_tail_anti_boost():
+    """A path ending in a bare property-type token is heavily downranked."""
+    assert classify_url(f"{_HOST}/biens/vente/maison").score < 0
+    assert classify_url(f"{_HOST}/recherche/appartements").score < 0

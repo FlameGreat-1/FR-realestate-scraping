@@ -97,6 +97,19 @@ _QUERY_HINTS = re.compile(
 
 _T_NOTATION = re.compile(r"\bt\d\b", re.IGNORECASE)
 
+# Bare property-type tail tokens: a path that ends with exactly one
+# of these (with no further qualifier or numeric reference) is a
+# category landing page. Compared against the lower-cased final
+# segment of the URL path.
+_BARE_HUB_TAILS: frozenset[str] = frozenset({
+    "maison", "maisons", "appartement", "appartements",
+    "villa", "villas", "terrain", "terrains",
+    "studio", "studios", "loft", "lofts",
+    "garage", "garages", "parking", "parkings",
+    "local", "locaux", "bureau", "bureaux",
+    "immeuble", "immeubles",
+})
+
 # Reasons the detail classifier emits when it rejects a URL specifically
 # because it looks like a hub/index. Used by `classify_seed` to decide
 # whether the URL is worth expanding (rather than scraping directly).
@@ -198,7 +211,7 @@ def classify_url(url: str) -> UrlClassification:
             break
 
     if _REFERENCE_HINTS.search(full):
-        score += 4
+        score += 8
         reason_bits.append("ref")
 
     if _QUERY_HINTS.search(full):
@@ -206,18 +219,27 @@ def classify_url(url: str) -> UrlClassification:
         reason_bits.append("query")
 
     if _T_NOTATION.search(full):
-        score += 1
+        score += 2
         reason_bits.append("t-notation")
 
     segments = [seg for seg in path.split("/") if seg]
     if len(segments) >= 3:
-        score += 1
+        score += 2
         reason_bits.append("deep_path")
 
     last = segments[-1] if segments else ""
     if re.search(r"\d{4,}", last):
-        score += 1
+        score += 2
         reason_bits.append("numeric_slug")
+
+    # Hub-tail anti-boost: when the last path segment is exactly a
+    # bare property-type token, the URL is a category landing page
+    # that slipped past the earlier hub guards. Push it below every
+    # plausible detail URL but keep it accepted so coverage on tiny
+    # sites is preserved.
+    if last in _BARE_HUB_TAILS:
+        score -= 8
+        reason_bits.append("hub_tail")
 
     # Reject 1-2 segment paths with no signal at all - these are nav
     # pages even if they happen to mention 'maison'.
