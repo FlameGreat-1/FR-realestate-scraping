@@ -228,12 +228,74 @@ class Pipeline:
         return ErrorReason.NO_LISTINGS_FOUND
 
     async def _enrich(self, listings: list[Listing]) -> None:
-        if not self._geocoder.enabled:
+        """Fill missing `coordinates` via the geocoder, in two bounded passes.
+
+        Pass 1 - cache-only fast path:
+            For each listing missing coordinates, attempt a synchronous,
+            lock-free cache read. Any value the geocoder has already
+            seen (this run or a persisted previous run) lands instantly.
+            This pass adds no wall-clock and no network.
+
+        Pass 2 - bounded resolve of the remainder:
+            Locations still missing are collected, deduplicated
+            in-memory, and resolved serially under a hard wall-clock
+            budget. When the budget is exhausted the remaining
+            listings simply do not receive coordinates - the field
+            is allowed to be empty and partial coverage is strictly
+            preferable to blowing the per-domain time budget.
+
+        Per-domain deduplication of locations means a domain emitting
+        60 listings across 4 distinct cities issues at most 4
+        Nominatim calls, not 60. The Nominatim 1-req/s rate limit is
+        still respected globally via the geocoder's internal lock.
+        """
+        if not self._geocoder.enabled or not listings:
             return
+
+        # Pass 1: cache-only fast path. Pure in-memory work.
+        pending: list[Listing] = []
         for listing in listings:
             if listing.coordinates or not listing.location:
                 continue
-            value = await self._geocoder.lookup(listing.location)
+            cached = self._geocoder.lookup_cached(listing.location)
+            if cached:
+                listing.coordinates = cached
+                continue
+            if self._geocoder.is_cached(listing.location):
+                # Known miss; do not re-issue.
+                continue
+            pending.append(listing)
+
+        if not pending:
+            return
+
+        # Pass 2: deduplicate by location string and resolve under a
+        # hard wall-clock budget. The resolved-this-pass map shares
+        # the result across listings that hold the same location.
+        budget = self._settings.geocoder_enrichment_budget
+        if budget <= 0:
+            return
+        deadline = asyncio.get_event_loop().time() + budget
+        resolved_locally: dict[str, str] = {}
+        for listing in pending:
+            key = listing.location.strip().lower()
+            if key in resolved_locally:
+                value = resolved_locally[key]
+                if value:
+                    listing.coordinates = value
+                continue
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                # Budget exhausted; leave the rest empty.
+                break
+            try:
+                value = await asyncio.wait_for(
+                    self._geocoder.lookup(listing.location),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                break
+            resolved_locally[key] = value or ""
             if value:
                 listing.coordinates = value
 
