@@ -121,6 +121,45 @@ def _from_class_encoded(parser: HTMLParser) -> str:
     return ""
 
 
+def _from_badge_text(parser: HTMLParser) -> str:
+    """Read the visible letter content of DPE-scoped badge elements.
+
+    Many CMSes render DPE as `<div class="dpe-badge">B</div>` where
+    the class name marks the element as DPE-related but does not
+    itself encode the letter. The element text is exactly the
+    rating letter. The selector scope is the same DPE-only one used
+    by the class-encoded path, so we cannot pick up unrelated body
+    letters elsewhere on the page.
+    """
+    try:
+        nodes = parser.css(_CLASS_SCOPE_SELECTOR)
+    except Exception:
+        return ""
+    for node in nodes:
+        text = (
+            node.text(deep=False, separator=" ", strip=True) or ""
+        ).strip()
+        if not text:
+            # Some templates wrap the letter in a single child element
+            # (`<div class="dpe-badge"><span>B</span></div>`); in that
+            # case `deep=False` returns empty. Fall back to the deep
+            # text but require it to still be a single letter.
+            text = (
+                node.text(deep=True, separator=" ", strip=True) or ""
+            ).strip()
+        if not text:
+            continue
+        # Must be exactly a single A-G letter, ignoring trailing
+        # punctuation. Anything else is a richer label that the
+        # labelled-text path already handles.
+        if len(text) > 3:
+            continue
+        cleaned = _clean_letter(text.strip(".:- "))
+        if cleaned:
+            return cleaned
+    return ""
+
+
 def _from_image_alts(parser: HTMLParser) -> str:
     try:
         nodes = parser.css("img[alt]")
@@ -163,6 +202,9 @@ class DpeResolver:
                 value = _from_class_encoded(parser)
                 if value:
                     return ResolverResult(value, 0.85, "class_encoded")
+                value = _from_badge_text(parser)
+                if value:
+                    return ResolverResult(value, 0.82, "badge_text")
                 value = _from_image_alts(parser)
                 if value:
                     return ResolverResult(value, 0.8, "img_alt")
