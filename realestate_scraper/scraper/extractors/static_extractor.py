@@ -18,6 +18,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
+
 from ..config import Settings
 from ..fingerprint import Fingerprint
 from ..http_client import HttpFetcher
@@ -32,11 +35,20 @@ log = logging.getLogger(__name__)
 class StaticExtractor:
     """Pulls listings using only async HTTP requests."""
 
-    def __init__(self, settings: Settings, fetcher: HttpFetcher) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        fetcher: HttpFetcher,
+        *,
+        parse_pool: Optional[ThreadPoolExecutor] = None,
+    ) -> None:
         self._settings = settings
         self._fetcher = fetcher
         self._discovery = CandidateDiscovery(settings, fetcher)
         self._listing_sem = asyncio.Semaphore(settings.listing_concurrency)
+        # Explicit parse pool: never the loop's default executor.
+        # See pipeline.Pipeline.run for the full rationale.
+        self._parse_pool = parse_pool
 
     async def gather_listings(
         self,
@@ -61,19 +73,22 @@ class StaticExtractor:
         seen_keys: set[str] = set()
         listing_budget = self._settings.listing_time_budget
 
+        loop = asyncio.get_running_loop()
+
         async def _process(url: str) -> Listing | None:
             async with self._listing_sem:
                 outcome = await self._fetcher.fetch(url)
             if not outcome.ok or not outcome.is_html_like or not outcome.text:
                 return None
-            # CPU-bound parse + resolver work runs OFF the event loop.
-            # See DynamicExtractor._process for the full rationale; the
-            # short version is that selectolax and the regex engine do
-            # NOT yield to asyncio, and running them on the loop
-            # serialises every concurrent domain into a single
-            # CPU-bound queue. `asyncio.to_thread` keeps the loop
-            # responsive and lets per-listing wait_for fire correctly.
-            return await asyncio.to_thread(
+            # CPU-bound parse + resolver work runs OFF the event loop
+            # on the dedicated parse pool. We use run_in_executor with
+            # an explicit pool argument rather than asyncio.to_thread:
+            # to_thread is hardcoded to the loop's default executor,
+            # which is shared with Playwright's chromium IPC. Mixing
+            # the two saturates Playwright's driver pipe and produces
+            # TargetClosedError cascades.
+            return await loop.run_in_executor(
+                self._parse_pool,
                 parse_and_build_listing,
                 outcome.final_url or url,
                 outcome.text,

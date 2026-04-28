@@ -86,26 +86,37 @@ class Pipeline:
         # the entire job list in memory.
         queue: asyncio.Queue = asyncio.Queue(maxsize=worker_count * 2)
 
-        # Dedicated thread pool for CPU-bound parse work. Sized to
-        # listing_concurrency so parse threads are shared fairly across
-        # domains. Without this, asyncio.to_thread uses the default
-        # pool (min(32, cpu+4) threads) which gets saturated when
-        # multiple domains submit hundreds of parse jobs, starving
-        # domains with few candidates.
+        # Dedicated thread pool for CPU-bound parse work (selectolax
+        # + regex + resolver pipeline). Sized to listing_concurrency
+        # so parse threads are shared fairly across domains.
+        #
+        # IMPORTANT: this pool is passed EXPLICITLY to
+        # loop.run_in_executor at every parse callsite. We do NOT
+        # install it as loop._default_executor: doing so forces every
+        # asyncio.to_thread() in the process onto the same pool,
+        # including Playwright's internal loop.run_in_executor(None,
+        # ...) calls that drive the chromium IPC pipe. When the parse
+        # pool saturates, Playwright cannot read from the driver,
+        # producing 'Connection closed while reading from the driver'
+        # and TargetClosedError cascades, plus domain timeouts that
+        # exceed domain_time_budget by 2-3x because the event loop
+        # itself is starved. Keep the pools separate.
         parse_pool = ThreadPoolExecutor(
             max_workers=self._settings.listing_concurrency,
             thread_name_prefix="parse",
         )
-        loop = asyncio.get_running_loop()
-        old_executor = loop._default_executor
-        loop._default_executor = parse_pool
 
         async with open_fetcher(self._settings) as fetcher:
             browser_pool = BrowserPool(self._settings)
             await browser_pool.start()
             try:
-                static = StaticExtractor(self._settings, fetcher)
-                dynamic = DynamicExtractor(self._settings, browser_pool, fetcher)
+                static = StaticExtractor(
+                    self._settings, fetcher, parse_pool=parse_pool,
+                )
+                dynamic = DynamicExtractor(
+                    self._settings, browser_pool, fetcher,
+                    parse_pool=parse_pool,
+                )
 
                 async def _producer() -> None:
                     for job in jobs:
@@ -133,7 +144,6 @@ class Pipeline:
                 )
             finally:
                 await browser_pool.close()
-                loop._default_executor = old_executor
                 parse_pool.shutdown(wait=False)
 
     async def _process_one(
