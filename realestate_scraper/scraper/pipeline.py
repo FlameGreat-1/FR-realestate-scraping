@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from concurrent.futures import ThreadPoolExecutor
+
 from .browser_pool import BrowserPool
 from .checkpoint import Checkpoint
 from .config import Settings, get_settings
@@ -84,16 +86,22 @@ class Pipeline:
         # the entire job list in memory.
         queue: asyncio.Queue = asyncio.Queue(maxsize=worker_count * 2)
 
+        # Dedicated thread pool for CPU-bound parse work. Sized to
+        # listing_concurrency so parse threads are shared fairly across
+        # domains. Without this, asyncio.to_thread uses the default
+        # pool (min(32, cpu+4) threads) which gets saturated when
+        # multiple domains submit hundreds of parse jobs, starving
+        # domains with few candidates.
+        parse_pool = ThreadPoolExecutor(
+            max_workers=self._settings.listing_concurrency,
+            thread_name_prefix="parse",
+        )
+        loop = asyncio.get_running_loop()
+        old_executor = loop._default_executor
+        loop._default_executor = parse_pool
+
         async with open_fetcher(self._settings) as fetcher:
             browser_pool = BrowserPool(self._settings)
-            # Pre-warm the Chromium browser process ONCE before any
-            # worker spawns. The lazy-on-first-borrow shape charged
-            # the launch cost (~1-3 s) to whichever domain happened
-            # to acquire the browser pool first - that is wrong
-            # engineering at any scale. Failure here is non-fatal:
-            # `is_available` returns False and the dynamic path
-            # gracefully degrades to the static-only fallback that
-            # the rest of the pipeline already handles.
             await browser_pool.start()
             try:
                 static = StaticExtractor(self._settings, fetcher)
@@ -125,6 +133,8 @@ class Pipeline:
                 )
             finally:
                 await browser_pool.close()
+                loop._default_executor = old_executor
+                parse_pool.shutdown(wait=False)
 
     async def _process_one(
         self,
