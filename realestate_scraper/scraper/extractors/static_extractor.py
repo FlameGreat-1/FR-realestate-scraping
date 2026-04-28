@@ -75,18 +75,19 @@ class StaticExtractor:
 
         loop = asyncio.get_running_loop()
 
-        async def _process(url: str) -> Listing | None:
-            async with self._listing_sem:
-                outcome = await self._fetcher.fetch(url)
+        async def _fetch_and_parse(url: str) -> Listing | None:
+            """Network + CPU-bound work, no semaphore here.
+
+            The caller holds `_listing_sem` for the full body. We do
+            NOT acquire it inside this coroutine because nesting
+            `asyncio.wait_for` around `async with semaphore` is a
+            documented asyncio anti-pattern (CPython gh-93999): a
+            timeout race can leak the slot, draining the semaphore
+            and deadlocking every subsequent task on this domain.
+            """
+            outcome = await self._fetcher.fetch(url)
             if not outcome.ok or not outcome.is_html_like or not outcome.text:
                 return None
-            # CPU-bound parse + resolver work runs OFF the event loop
-            # on the dedicated parse pool. We use run_in_executor with
-            # an explicit pool argument rather than asyncio.to_thread:
-            # to_thread is hardcoded to the loop's default executor,
-            # which is shared with Playwright's chromium IPC. Mixing
-            # the two saturates Playwright's driver pipe and produces
-            # TargetClosedError cascades.
             return await loop.run_in_executor(
                 self._parse_pool,
                 parse_and_build_listing,
@@ -98,25 +99,25 @@ class StaticExtractor:
         async def _bounded_process(url: str) -> Listing | None:
             """Per-listing wall-clock guard.
 
-            Mirrors the dynamic extractor's bound (Round 6). A URL
-            whose httpx fetch + parse + resolver pipeline does not
-            complete inside `listing_time_budget` is dropped
-            silently. The other candidates are independent and
-            continue.
+            Semaphore acquire is OUTSIDE wait_for. wait_for only
+            wraps the fetch + parse, so a timeout cancels the work
+            but the semaphore __aexit__ always runs on a live task
+            and the slot is released cleanly.
             """
-            try:
-                return await asyncio.wait_for(
-                    _process(url), timeout=listing_budget,
-                )
-            except asyncio.TimeoutError:
-                log.debug(
-                    "static: listing %s exceeded %.1fs budget, dropping",
-                    url, listing_budget,
-                )
-                return None
-            except Exception as exc:  # noqa: BLE001
-                log.debug("static: listing %s failed: %s", url, exc)
-                return None
+            async with self._listing_sem:
+                try:
+                    return await asyncio.wait_for(
+                        _fetch_and_parse(url), timeout=listing_budget,
+                    )
+                except asyncio.TimeoutError:
+                    log.debug(
+                        "static: listing %s exceeded %.1fs budget, dropping",
+                        url, listing_budget,
+                    )
+                    return None
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("static: listing %s failed: %s", url, exc)
+                    return None
 
         tasks = [
             asyncio.create_task(_bounded_process(url)) for url in candidates

@@ -139,15 +139,22 @@ class DynamicExtractor:
         # can enforce the per-domain budget without a racy semaphore.
         escalation_count: list[int] = [0]
 
-        async def _process(url: str) -> Optional[Listing]:
+        async def _fetch_and_parse(url: str) -> Optional[Listing]:
+            """Network + CPU-bound work, no listing_sem here.
+
+            See static_extractor for the rationale: semaphore acquire
+            must be OUTSIDE wait_for to avoid the cancellation race
+            that leaks slots (CPython gh-93999).
+
+            Note `_get_html` still acquires `_listing_sem` internally
+            for its httpx fetch step. That is by design: the inner
+            acquire is short-lived and not wrapped by a wait_for that
+            covers the acquire itself - the outer _bounded_process
+            handles the budget.
+            """
             html = await self._get_html(url, escalation_count)
             if not html:
                 return None
-            # CPU-bound parse + resolver work runs OFF the event loop
-            # on the dedicated parse pool, NOT the loop's default
-            # executor. The default pool is shared with Playwright's
-            # chromium IPC; saturating it with parse jobs stalls the
-            # driver pipe and produces TargetClosedError cascades.
             return await loop.run_in_executor(
                 self._parse_pool,
                 parse_and_build_listing,
@@ -157,14 +164,12 @@ class DynamicExtractor:
         async def _bounded_process(url: str) -> Optional[Listing]:
             """Per-listing wall-clock guard.
 
-            A single URL must NEVER dominate the per-domain budget,
-            even when shared resources (browser pool, httpx pool,
-            per-host limiter) interact in unexpected ways. The wait_for
-            cap is the architectural guarantee.
+            wait_for wraps only the fetch + parse, never a semaphore
+            acquire that would race on cancellation.
             """
             try:
                 return await asyncio.wait_for(
-                    _process(url), timeout=listing_budget,
+                    _fetch_and_parse(url), timeout=listing_budget,
                 )
             except asyncio.TimeoutError:
                 log.debug(
