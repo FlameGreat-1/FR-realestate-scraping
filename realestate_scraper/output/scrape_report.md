@@ -5,76 +5,76 @@
 - Successful domains: `15`
 - Failed domains: `23`
 - Domain success rate: `39.5%`
-- Total listings written: `410`
+- Total listings written: `315`
 
 ## Field Completeness
 | Field | Filled rows | Fill rate |
 | --- | --- | --- |
-| reference_id | 271 | 66.1% |
-| price | 320 | 78.0% |
-| property_type | 368 | 89.8% |
-| location | 407 | 99.3% |
-| surface_area | 375 | 91.5% |
-| rooms | 350 | 85.4% |
-| bedrooms | 322 | 78.5% |
-| agency_name | 410 | 100.0% |
-| agent_name | 229 | 55.9% |
-| phone_number | 410 | 100.0% |
-| email | 260 | 63.4% |
-| coordinates | 297 | 72.4% |
-| dpe_rating | 51 | 12.4% |
-| source_url | 410 | 100.0% |
-| source_domain | 410 | 100.0% |
+| reference_id | 176 | 55.9% |
+| price | 268 | 85.1% |
+| property_type | 273 | 86.7% |
+| location | 315 | 100.0% |
+| surface_area | 284 | 90.2% |
+| rooms | 276 | 87.6% |
+| bedrooms | 248 | 78.7% |
+| agency_name | 315 | 100.0% |
+| agent_name | 188 | 59.7% |
+| phone_number | 315 | 100.0% |
+| email | 225 | 71.4% |
+| coordinates | 169 | 53.7% |
+| dpe_rating | 69 | 21.9% |
+| source_url | 315 | 100.0% |
+| source_domain | 315 | 100.0% |
 
 ## Top Successful Domains
 | Domain | Listings |
 | --- | --- |
-| 2m-immo.com | 79 |
-| piriac-immobilier.fr | 63 |
-| groupecif.com | 48 |
-| agencecoullaud.fr | 45 |
-| agencemathieu.fr | 35 |
-| immoso.fr | 33 |
-| grisel-immobilier.fr | 23 |
-| nestenn.com | 21 |
-| tit-immobilier.com | 20 |
+| grisel-immobilier.fr | 40 |
+| agencemathieu.fr | 34 |
+| immoso.fr | 32 |
+| nestenn.com | 30 |
+| agencecoullaud.fr | 29 |
+| 2m-immo.com | 29 |
+| tit-immobilier.com | 21 |
+| piriac-immobilier.fr | 21 |
+| groupecif.com | 20 |
+| agencegrossi.com | 20 |
+| groupimmo.pro | 12 |
 | imbs-immo.com | 12 |
-| groupimmo.pro | 10 |
 | lgo-immobilier.fr | 8 |
-| rhpatrimoine.com | 5 |
-| agencedesflots.com | 5 |
-| beausejour-immobilier.fr | 3 |
+| rhpatrimoine.com | 6 |
+| agencedesflots.com | 1 |
 
 ## Failure Reasons
 | Reason | Count |
 | --- | --- |
-| no_listings_found | 18 |
+| no_listings_found | 17 |
+| blocked_403 | 3 |
 | site_not_reachable | 3 |
-| blocked_403 | 2 |
 
 ## Failed Domains
 | Domain | Status | Reason |
 | --- | --- | --- |
 | stephaneplazaimmobilier.com | failed | blocked_403 |
-| maxihome.net | failed | no_listings_found |
 | capwestresidence.fr | failed | no_listings_found |
 | pietrapolis.fr | failed | no_listings_found |
-| carmen-immobilier.com | failed | site_not_reachable |
-| zelidom.fr | failed | no_listings_found |
 | maisonsoxygene.com | failed | no_listings_found |
-| mg-immobilier.com | failed | no_listings_found |
-| agencealbert1er.fr | failed | no_listings_found |
+| beausejour-immobilier.fr | failed | blocked_403 |
+| carmen-immobilier.com | failed | site_not_reachable |
+| maxihome.net | failed | no_listings_found |
 | cosialis.fr | failed | no_listings_found |
 | igor-immobilier.com | failed | no_listings_found |
-| sporting-immobilier.fr | failed | no_listings_found |
-| agencegrossi.com | failed | no_listings_found |
+| zelidom.fr | failed | no_listings_found |
+| agencealbert1er.fr | failed | no_listings_found |
+| mg-immobilier.com | failed | site_not_reachable |
 | agencedeneuville.com | failed | site_not_reachable |
-| well-estate.fr | failed | no_listings_found |
-| wretmanestate.com | failed | site_not_reachable |
+| sporting-immobilier.fr | failed | no_listings_found |
 | erapontdelarc.com | failed | blocked_403 |
-| novilis.fr | failed | no_listings_found |
+| well-estate.fr | failed | no_listings_found |
 | aio-immobiliere.com | failed | no_listings_found |
 | erafrance.com | failed | no_listings_found |
+| novilis.fr | failed | no_listings_found |
 | vancia-immobilier.fr | failed | no_listings_found |
 | immobiliere-de-croix.com | failed | no_listings_found |
+| wretmanestate.com | failed | no_listings_found |
 | jeminstalleici.com | failed | no_listings_found |

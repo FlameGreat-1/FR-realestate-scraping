@@ -45,11 +45,6 @@ _NON_LISTING_TERMS = (
     "estimez-votre-bien", "estimer-mon-bien", "evaluer-mon-bien",
     "vendre-mon-bien", "louer-mon-bien", "mettre-en-location",
     "mettre-en-vente", "deposer-une-annonce", "prendre-rendez-vous",
-    # Rental / vacation categories: this brief is for sale listings.
-    "location-vacances", "location-saisonniere",
-    # Programme neuf / investment pages
-    "programme-neuf", "programmes-neufs", "defiscalisation",
-    "dispositif", "dispositifs",
 )
 
 _HUB_PATHS = {

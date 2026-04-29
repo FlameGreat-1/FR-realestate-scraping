@@ -56,12 +56,26 @@ class StaticExtractor:
         job: DomainJob,
         fingerprint: Fingerprint,
     ) -> list[Listing]:
-        candidates = await self._discovery.discover(
-            job,
-            fingerprint.families,
-            homepage_html=fingerprint.homepage_html or None,
-            base_url=fingerprint.final_url or job.url,
+        discovery_budget = (
+            self._settings.domain_time_budget
+            * self._settings.discovery_budget_ratio
         )
+        try:
+            candidates = await asyncio.wait_for(
+                self._discovery.discover(
+                    job,
+                    fingerprint.families,
+                    homepage_html=fingerprint.homepage_html or None,
+                    base_url=fingerprint.final_url or job.url,
+                ),
+                timeout=discovery_budget,
+            )
+        except asyncio.TimeoutError:
+            log.info(
+                "static: %s discovery budget exhausted after %.0fs",
+                job.domain, discovery_budget,
+            )
+            candidates = []
         if not candidates:
             log.info("static: no candidate listings for %s", job.domain)
             return []

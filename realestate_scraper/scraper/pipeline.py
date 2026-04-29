@@ -265,29 +265,36 @@ class Pipeline:
         def _remaining() -> float:
             return budget - (time.perf_counter() - domain_start)
 
-        if fingerprint.suggested_strategy == Strategy.STATIC:
+        # Strategy: static-first for all reachable sites.
+        #
+        # Static extraction uses only httpx (no browser pool slots,
+        # no Playwright overhead) and completes in 20-40s. Dynamic
+        # extraction renders the homepage in Playwright (~15-30s per
+        # browser slot) and then renders each detail page, consuming
+        # 60-90s of the 120s domain budget. Running dynamic first
+        # for DYNAMIC-fingerprinted sites left no budget for the
+        # static fallback, causing cascading timeouts.
+        #
+        # The only exception is BLOCKED_403: httpx gets rejected by
+        # WAF interstitials, so static cannot discover candidates.
+        # Those sites go dynamic-first where Playwright can solve
+        # the challenge page.
+
+        if fingerprint.failure_reason == ErrorReason.BLOCKED_403:
+            # WAF-blocked: dynamic is the only viable path.
+            listings = await self._try_dynamic(job, dynamic, fingerprint)
+            used = Strategy.DYNAMIC if listings else Strategy.NONE
+        else:
+            # Static-first: cheap, fast, no browser contention.
             listings = await static.gather_listings(job, fingerprint)
             used = Strategy.STATIC
             if not listings and _remaining() > min_fallback_budget:
-                # Static run yielded nothing and we have enough budget
-                # left for a meaningful dynamic attempt.
+                # Static yielded nothing — try dynamic with the
+                # remaining budget. ~80s typically remains, enough
+                # for a full dynamic gather cycle.
                 listings = await self._try_dynamic(job, dynamic, fingerprint)
                 if listings:
                     used = Strategy.HYBRID
-        else:
-            listings = await self._try_dynamic(job, dynamic, fingerprint)
-            used = Strategy.DYNAMIC if listings else Strategy.NONE
-            if (
-                not listings
-                and fingerprint.failure_reason != ErrorReason.BLOCKED_403
-                and _remaining() > min_fallback_budget
-            ):
-                # Last-ditch static attempt for misclassified sites,
-                # only if we have enough budget remaining.
-                static_listings = await static.gather_listings(job, fingerprint)
-                if static_listings:
-                    listings = static_listings
-                    used = Strategy.STATIC
 
         if not listings:
             reason = self._reason_for_empty(fingerprint, dynamic.is_available)

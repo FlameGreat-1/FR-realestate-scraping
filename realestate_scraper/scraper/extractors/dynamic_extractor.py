@@ -132,7 +132,21 @@ class DynamicExtractor:
         if not self.is_available:
             return []
 
-        candidates = await self._discover_candidates(job, fingerprint)
+        discovery_budget = (
+            self._settings.domain_time_budget
+            * self._settings.discovery_budget_ratio
+        )
+        try:
+            candidates = await asyncio.wait_for(
+                self._discover_candidates(job, fingerprint),
+                timeout=discovery_budget,
+            )
+        except asyncio.TimeoutError:
+            log.info(
+                "dynamic: %s discovery budget exhausted after %.0fs",
+                job.domain, discovery_budget,
+            )
+            candidates = []
         if not candidates:
             log.info("dynamic: no candidate listings for %s", job.domain)
             return []

@@ -159,8 +159,6 @@ def _candidate_dom_nodes(
         except Exception:
             continue
         for node in nodes:
-            if _node_is_rent_coded(node):
-                continue
             attr_value = (
                 node.attributes.get("content")
                 or node.attributes.get("data-price")
@@ -181,8 +179,17 @@ def _accept_amount(
     guard_text: str = "",
     require_sale_marker: bool = False,
     require_currency_or_label: bool = False,
+    reject_rent: bool = True,
 ) -> str:
-    """Validate `candidate`, return the canonical digits-only price or empty."""
+    """Validate `candidate`, return the canonical digits-only price or empty.
+
+    :param reject_rent:
+        When True (default), candidates whose surrounding text carries
+        rental markers (/mois, charges comprises, …) are rejected.
+        Callers that already know the node came from structured price
+        markup (DOM selector, labelled inline) pass False so rental
+        listings are not silently dropped.
+    """
     if not candidate:
         return ""
     text = str(candidate)
@@ -190,7 +197,7 @@ def _accept_amount(
         return ""
     if _is_per_m2(text) or _is_per_m2(guard_text):
         return ""
-    if _is_rent(text) or _is_rent(guard_text):
+    if reject_rent and (_is_rent(text) or _is_rent(guard_text)):
         return ""
     if require_sale_marker and not _has_sale_marker(guard_text):
         return ""
@@ -232,23 +239,6 @@ class PriceResolver:
     name = "price"
 
     def resolve(self, ctx: PageContext) -> ResolverResult:
-        # URL-level rental guard: when the listing URL itself contains
-        # strong rental markers, we skip extraction entirely. The
-        # existing _RENT_CONTEXT guard operates on text windows around
-        # individual price amounts and cannot catch DPE/diagnostic
-        # numbers located in unrelated sections of rental pages.
-        if ctx.url:
-            url_lower = ctx.url.lower()
-            url_path = url_lower.split("?", 1)[0]
-            if any(marker in url_path for marker in (
-                "/location/", "/locations/", "/louer/",
-                "-mois", "/mois", "location-vacances",
-                "location-saisonniere",
-            )):
-                return ResolverResult("", 0.0, "")
-            # Cosialis-class slug: `…-580e-mois`, `…-657e-mois`
-            if re.search(r"\d+e[/-]mois", url_path):
-                return ResolverResult("", 0.0, "")
 
         # 1. JSON-LD
         ld_price = ctx.json_ld.get("price") if ctx.json_ld else None
@@ -274,13 +264,16 @@ class PriceResolver:
                 candidate,
                 guard_text=_node_window(node),
                 require_currency_or_label=True,
+                reject_rent=False,
             )
             if cleaned:
                 return ResolverResult(cleaned, 0.85, "dom")
 
         # 4. Labelled text. The label *is* the sale marker.
         for candidate in find_priced_labels(ctx.text):
-            cleaned = _accept_amount(candidate, guard_text=candidate)
+            cleaned = _accept_amount(
+                candidate, guard_text=candidate, reject_rent=False,
+            )
             if cleaned:
                 return ResolverResult(cleaned, 0.7, "label")
 

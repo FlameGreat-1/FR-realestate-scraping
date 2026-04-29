@@ -62,17 +62,17 @@ class Settings(BaseSettings):
     browser_nav_timeout: float = Field(default=15.0, gt=0)
 
     # --- Limits ---
-    # 80 candidates balances coverage and speed: 80 / 6 per-host * 10s
-    # fetch = 133s worst case, but real-world latency is lower since
-    # most fetches complete in 1-2s. The ranking in
-    # discovery.rank_and_limit puts highest-scoring URLs first, so 80
-    # captures the bulk of legitimate listings without the tail of
-    # diminishing-return URLs that 120 included.
-    max_listing_urls_per_domain: int = Field(default=80, ge=1)
+    # 40 candidates is the sweet spot: 40 / 6 per-host * 10s fetch =
+    # 67s worst case, fitting comfortably in the 120s domain budget.
+    # The ranking in discovery.rank_and_limit already puts the highest-
+    # scoring URLs first, so 40 captures the best candidates. At 55k+
+    # scale, processing fewer high-quality URLs per domain is faster
+    # and produces better data than attempting 120 and timing out.
+    max_listing_urls_per_domain: int = Field(default=40, ge=1)
     max_seed_urls_per_domain: int = Field(default=80, ge=1)
     max_sitemap_depth: int = Field(default=2, ge=1, le=5)
     seed_expansion_depth: int = Field(default=2, ge=0, le=4)
-    max_hub_pages_per_domain: int = Field(default=12, ge=0, le=128)
+    max_hub_pages_per_domain: int = Field(default=6, ge=0, le=128)
     # Hard wall-clock cap on processing a single listing URL (httpx
     # + optional Playwright fallback + parse + resolver pipeline).
     # A URL that does not yield within this budget is dropped; the
@@ -88,8 +88,14 @@ class Settings(BaseSettings):
     # path produces zero listings. Raising either ratio risks the
     # outer domain timeout firing during cleanup. The two ratios
     # need not sum to 1: only one gather runs at a time per domain.
-    static_gather_budget_ratio: float = Field(default=0.55, gt=0, le=1.0)
-    dynamic_gather_budget_ratio: float = Field(default=0.70, gt=0, le=1.0)
+    static_gather_budget_ratio: float = Field(default=0.45, gt=0, le=1.0)
+    dynamic_gather_budget_ratio: float = Field(default=0.55, gt=0, le=1.0)
+    # Fraction of `domain_time_budget` reserved for the discovery
+    # phase (sitemap + homepage harvest + hub BFS). Discovery that
+    # exceeds this budget is cancelled and the gather phase runs
+    # with whatever candidates were found so far. 0.30 = 36s at
+    # the default 120s domain budget, leaving ~84s for the gather.
+    discovery_budget_ratio: float = Field(default=0.30, gt=0, le=1.0)
 
     # --- Behaviour ---
     verify_tls: bool = Field(default=False)
