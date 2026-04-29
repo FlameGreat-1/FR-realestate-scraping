@@ -93,24 +93,16 @@ class Pipeline:
         # the entire job list in memory.
         queue: asyncio.Queue = asyncio.Queue(maxsize=worker_count * 2)
 
-        # Dedicated thread pool for CPU-bound parse work (selectolax
-        # + regex + resolver pipeline). Sized to listing_concurrency
-        # so parse threads are shared fairly across domains.
-        #
-        # IMPORTANT: this pool is passed EXPLICITLY to
-        # loop.run_in_executor at every parse callsite. We do NOT
-        # install it as loop._default_executor: doing so forces every
-        # asyncio.to_thread() in the process onto the same pool,
-        # including Playwright's internal loop.run_in_executor(None,
-        # ...) calls that drive the chromium IPC pipe. When the parse
-        # pool saturates, Playwright cannot read from the driver,
-        # producing 'Connection closed while reading from the driver'
-        # and TargetClosedError cascades, plus domain timeouts that
-        # exceed domain_time_budget by 2-3x because the event loop
-        # itself is starved. Keep the pools separate.
-        parse_pool = ThreadPoolExecutor(
+        from concurrent.futures import ProcessPoolExecutor
+        # Dedicated process pool for CPU-bound parse work (selectolax
+        # + regex + resolver pipeline). A ThreadPoolExecutor would share
+        # the main process's GIL, meaning pathological HTML parsed in C
+        # would completely freeze the asyncio event loop for minutes.
+        # By using a ProcessPoolExecutor, the heavy C-extensions run in
+        # isolated processes, ensuring the orchestrator's event loop
+        # timers (wait_for) always fire perfectly on time.
+        parse_pool = ProcessPoolExecutor(
             max_workers=self._settings.listing_concurrency,
-            thread_name_prefix="parse",
         )
 
         async with open_fetcher(self._settings) as fetcher:
@@ -176,7 +168,7 @@ class Pipeline:
             )
             result = await asyncio.wait_for(
                 self._scrape_domain(
-                    job, static, dynamic, fetcher, fingerprint,
+                    job, static, dynamic, fetcher, fingerprint, deadline,
                 ),
                 timeout=max(0.1, deadline - time.perf_counter()),
             )
@@ -237,10 +229,12 @@ class Pipeline:
         dynamic: DynamicExtractor,
         fetcher,
         fingerprint: Fingerprint,
+        deadline: float,
     ) -> DomainResult:
-        domain_start = time.perf_counter()
+        # Give the inner extractors a slightly tighter deadline so they
+        # finish gracefully before the outer wait_for throws a hard kill.
+        inner_deadline = deadline - 2.0
         budget = self._settings.domain_time_budget
-        deadline = domain_start + budget
         # Reserve 20% of the domain budget as a minimum threshold for
         # starting a fallback extraction strategy. If the primary
         # strategy consumed most of the budget, attempting a second
@@ -250,7 +244,7 @@ class Pipeline:
         log.info("start %s", job.domain)
 
         def _remaining() -> float:
-            return max(0.0, deadline - time.perf_counter())
+            return max(0.0, inner_deadline - time.perf_counter())
 
         if (
             fingerprint.failure_reason == ErrorReason.SITE_NOT_REACHABLE
@@ -265,9 +259,6 @@ class Pipeline:
 
         listings: list[Listing] = []
         used = Strategy.NONE
-
-        def _remaining() -> float:
-            return budget - (time.perf_counter() - domain_start)
 
         # Strategy: static-first for all reachable sites.
         #
@@ -287,13 +278,13 @@ class Pipeline:
         if fingerprint.failure_reason == ErrorReason.BLOCKED_403:
             # WAF-blocked: dynamic is the only viable path.
             listings = await self._try_dynamic(
-                job, dynamic, fingerprint, deadline,
+                job, dynamic, fingerprint, inner_deadline,
             )
             used = Strategy.DYNAMIC if listings else Strategy.NONE
         else:
             # Static-first: cheap, fast, no browser contention.
             listings = await static.gather_listings(
-                job, fingerprint, deadline,
+                job, fingerprint, inner_deadline,
             )
             used = Strategy.STATIC
             if not listings and _remaining() > min_fallback_budget:
@@ -301,7 +292,7 @@ class Pipeline:
                 # remaining budget. ~80s typically remains, enough
                 # for a full dynamic gather cycle.
                 listings = await self._try_dynamic(
-                    job, dynamic, fingerprint, deadline,
+                    job, dynamic, fingerprint, inner_deadline,
                 )
                 if listings:
                     used = Strategy.HYBRID
@@ -562,6 +553,16 @@ async def run_pipeline(
     settings = get_settings()
     configure_logging(level=settings.log_level, json_format=settings.log_json)
 
+    # Suppress harmless Playwright future cancellation warnings that
+    # occur when a domain's browser tab is aggressively severed.
+    loop = asyncio.get_running_loop()
+    def _suppress_playwright_cancellations(loop, context):
+        msg = str(context.get("exception", context.get("message", "")))
+        if "TargetClosedError" in msg or "net::ERR_ABORTED" in msg:
+            return
+        loop.default_exception_handler(context)
+    loop.set_exception_handler(_suppress_playwright_cancellations)
+
     bundle = build_output_bundle(
         listings_path=settings.listings_csv_path,
         errors_path=settings.error_log_csv_path,
@@ -616,3 +617,10 @@ async def run_pipeline(
     # they cannot mask a successful run.
     from .report import generate_report
     generate_report(settings)
+
+    # Allow asyncio transports (specifically Playwright's internal
+    # subprocess pipe) to cleanly flush their closure events before
+    # asyncio.run() destroys the event loop. Prevents the noisy
+    # "Exception ignored in ... RuntimeError: Event loop is closed"
+    # warning during Python interpreter teardown.
+    await asyncio.sleep(0.25)

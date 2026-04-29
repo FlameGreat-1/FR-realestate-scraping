@@ -348,17 +348,24 @@ class HttpFetcher:
         *,
         headers: Mapping[str, str],
         timeout: Optional[float],
+        max_bytes: int = 3_000_000,
     ) -> FetchOutcome:
         timeout_value = timeout or self._fetch_timeout
 
-        async def _do() -> httpx.Response:
+        async def _do() -> tuple[httpx.Response, bytes]:
             async with self._limiter.slot(url):
-                return await self._client.get(
-                    url, timeout=timeout_value, headers=headers
-                )
+                async with self._client.stream(
+                    "GET", url, timeout=timeout_value, headers=headers
+                ) as response:
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > max_bytes:
+                            break
+                    return response, bytes(body)
 
         try:
-            response = await with_retry(
+            response, body_bytes = await with_retry(
                 _do,
                 max_attempts=max(1, self._max_retries + 1),
                 backoff=self._retry_backoff,
@@ -375,7 +382,7 @@ class HttpFetcher:
         text = ""
         if 200 <= response.status_code < 400:
             try:
-                text = response.text
+                text = body_bytes.decode(response.encoding or "utf-8", errors="replace")
             except Exception as exc:  # noqa: BLE001
                 log.debug("decoding %s failed: %s", url, exc)
                 text = ""

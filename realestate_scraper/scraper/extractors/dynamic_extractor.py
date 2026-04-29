@@ -410,6 +410,12 @@ class DynamicExtractor:
                         raise
                 try:
                     html = await page.content()
+                    # Hard truncation of the string. Runaway React loops
+                    # can expand the DOM to 50MB+ before budget exhaustion.
+                    # Passing 50MB+ to selectolax's C-extension locks the
+                    # Python GIL for minutes. 3MB is generous for any site.
+                    if len(html) > 3_000_000:
+                        html = html[:3_000_000]
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
                         "dynamic content() %s failed (race): %s",

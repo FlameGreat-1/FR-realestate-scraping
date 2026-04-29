@@ -32,11 +32,14 @@ from .headers import build_headers, profile_for_url
 
 log = logging.getLogger(__name__)
 
-_BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+_BLOCKED_RESOURCE_TYPES = {
+    "image", "media", "font", "stylesheet", "websocket", "eventsource",
+    "manifest", "other", "texttrack", "beacon", "ping", "csp_report",
+}
 _BLOCKED_URL_FRAGMENTS = (
     "google-analytics", "googletagmanager", "doubleclick", "facebook.net",
     "hotjar", "clarity.ms", "matomo", "segment.io", "sentry.io",
-    "youtube.com/embed",
+    "youtube.com/embed", "vimeo", "chat", "intercom", "crisp",
 )
 _DEFAULT_ACCEPT = (
     "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -173,9 +176,14 @@ class BrowserPool:
                 self._settings.accept_language, fallback="fr-FR"
             ),
         )
-        # Resource interception lives on the context, so blocking is
-        # active for every page opened on it without per-page setup.
-        await context.route("**/*", _route_handler)
+        # We explicitly DO NOT intercept routes (e.g. `context.route("**/*")`)
+        # in the Python worker. Playwright's route interception bridges
+        # every single matching network request over an IPC pipe to Python.
+        # Malicious or buggy SPAs that enter infinite fetch/image loops
+        # will flood the IPC pipe, locking Python's GIL for minutes while
+        # parsing JSON, causing fatal event loop starvation and catastrophic
+        # pipeline timeouts. We sacrifice the bandwidth of downloading
+        # images/fonts to guarantee absolute event loop stability.
         self._all_contexts.append(context)
         return context
 
