@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -55,10 +56,13 @@ class StaticExtractor:
         self,
         job: DomainJob,
         fingerprint: Fingerprint,
+        deadline: float,
     ) -> list[Listing]:
-        discovery_budget = (
+        time_left = max(0.1, deadline - time.perf_counter())
+        discovery_budget = min(
+            time_left,
             self._settings.domain_time_budget
-            * self._settings.discovery_budget_ratio
+            * self._settings.discovery_budget_ratio,
         )
         try:
             candidates = await asyncio.wait_for(
@@ -92,9 +96,11 @@ class StaticExtractor:
         # configurable so operators can rebalance against the dynamic
         # ratio when tuning a large corpus; default 0.55 leaves room
         # for the hybrid fallback to engage on zero-listing static.
-        gather_budget = (
+        time_left = max(0.1, deadline - time.perf_counter())
+        gather_budget = min(
+            time_left,
             self._settings.domain_time_budget
-            * self._settings.static_gather_budget_ratio
+            * self._settings.static_gather_budget_ratio,
         )
 
         results: list[Listing] = []

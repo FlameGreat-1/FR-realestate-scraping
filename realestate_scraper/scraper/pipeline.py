@@ -240,6 +240,7 @@ class Pipeline:
     ) -> DomainResult:
         domain_start = time.perf_counter()
         budget = self._settings.domain_time_budget
+        deadline = domain_start + budget
         # Reserve 20% of the domain budget as a minimum threshold for
         # starting a fallback extraction strategy. If the primary
         # strategy consumed most of the budget, attempting a second
@@ -247,6 +248,9 @@ class Pipeline:
         min_fallback_budget = budget * 0.20
 
         log.info("start %s", job.domain)
+
+        def _remaining() -> float:
+            return max(0.0, deadline - time.perf_counter())
 
         if (
             fingerprint.failure_reason == ErrorReason.SITE_NOT_REACHABLE
@@ -282,17 +286,23 @@ class Pipeline:
 
         if fingerprint.failure_reason == ErrorReason.BLOCKED_403:
             # WAF-blocked: dynamic is the only viable path.
-            listings = await self._try_dynamic(job, dynamic, fingerprint)
+            listings = await self._try_dynamic(
+                job, dynamic, fingerprint, deadline,
+            )
             used = Strategy.DYNAMIC if listings else Strategy.NONE
         else:
             # Static-first: cheap, fast, no browser contention.
-            listings = await static.gather_listings(job, fingerprint)
+            listings = await static.gather_listings(
+                job, fingerprint, deadline,
+            )
             used = Strategy.STATIC
             if not listings and _remaining() > min_fallback_budget:
                 # Static yielded nothing — try dynamic with the
                 # remaining budget. ~80s typically remains, enough
                 # for a full dynamic gather cycle.
-                listings = await self._try_dynamic(job, dynamic, fingerprint)
+                listings = await self._try_dynamic(
+                    job, dynamic, fingerprint, deadline,
+                )
                 if listings:
                     used = Strategy.HYBRID
 
@@ -321,11 +331,12 @@ class Pipeline:
         job: DomainJob,
         dynamic: DynamicExtractor,
         fingerprint: Fingerprint,
+        deadline: float,
     ) -> list[Listing]:
         if not dynamic.is_available:
             return []
         try:
-            return await dynamic.gather_listings(job, fingerprint)
+            return await dynamic.gather_listings(job, fingerprint, deadline)
         except Exception as exc:  # noqa: BLE001
             log.debug("dynamic extractor crashed for %s: %s", job.domain, exc)
             return []

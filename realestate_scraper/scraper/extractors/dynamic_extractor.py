@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -128,13 +129,16 @@ class DynamicExtractor:
         self,
         job: DomainJob,
         fingerprint: Fingerprint,
+        deadline: float,
     ) -> list[Listing]:
         if not self.is_available:
             return []
 
-        discovery_budget = (
+        time_left = max(0.1, deadline - time.perf_counter())
+        discovery_budget = min(
+            time_left,
             self._settings.domain_time_budget
-            * self._settings.discovery_budget_ratio
+            * self._settings.discovery_budget_ratio,
         )
         try:
             candidates = await asyncio.wait_for(
@@ -162,9 +166,11 @@ class DynamicExtractor:
         # guarantees we hand control back regardless. The ratio is
         # configurable so operators can rebalance against the static
         # ratio when tuning a large corpus.
-        gather_budget = (
+        time_left = max(0.1, deadline - time.perf_counter())
+        gather_budget = min(
+            time_left,
             self._settings.domain_time_budget
-            * self._settings.dynamic_gather_budget_ratio
+            * self._settings.dynamic_gather_budget_ratio,
         )
 
         results: list[Listing] = []
